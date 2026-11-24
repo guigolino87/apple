@@ -187,6 +187,7 @@ nav a.active{color:var(--acc);background:rgba(0,212,170,0.1);border-left-color:v
 .main{margin-left:240px;flex:1}
 .topbar{background:var(--sb);border-bottom:1px solid var(--bdr);padding:16px 32px;display:flex;align-items:center;justify-content:space-between}
 .topbar h1{font-size:1.25rem;font-weight:600}
+.hamburger{display:none;background:none;border:none;color:var(--txt);font-size:1.5rem;cursor:pointer;margin-right:12px}
 .content{padding:24px 32px}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;margin-bottom:24px}
 .card{background:var(--card);border:1px solid var(--bdr);border-radius:12px;padding:20px;position:relative;overflow:hidden}
@@ -226,7 +227,8 @@ tr:hover td{background:rgba(0,212,170,0.03)}
 .tl{flex:1}.tl strong{display:block;font-size:0.9rem}.tl span{font-size:0.75rem;color:var(--dim)}
 .tabs{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;border-bottom:1px solid var(--bdr);padding-bottom:12px}
 @media (max-width: 768px) {
-  .sidebar{display:none;}
+  .sidebar{transform:translateX(-100%);transition:transform 0.3s ease-in-out;display:flex;}
+  .sidebar.open{transform:translateX(0);}
   .main{margin-left:0;}
   .content{padding:16px;}
   .cards{grid-template-columns:1fr;}
@@ -234,13 +236,16 @@ tr:hover td{background:rgba(0,212,170,0.03)}
   .tabs{flex-direction:column;}
   .tabs .btn{width:100%;justify-content:center;}
   .tg{flex-direction:column;text-align:center;}
+  .sidebar-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:99;}
+  .sidebar.open + .sidebar-overlay{display:block;}
+  .hamburger{display:block;}
 }
 </style>"""
 
 BASE = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>PiNAPPLE &mdash; {title}</title>{css}</head><body>{nav}
-<main class="main"><div class="topbar"><h1>{title}</h1>
+<div class="sidebar-overlay" onclick="toggleMenu()"></div><main class="main"><div class="topbar"><button class="hamburger" onclick="toggleMenu()">&#9776;</button><h1>{title}</h1>
 <span style="font-size:0.75rem;color:var(--dim)" id="clk"></span></div>
 <div class="content">{content}</div></main>
 <script>
@@ -251,6 +256,9 @@ async function api(url,method,body){{
   if(body)o.body=JSON.stringify(body);
   const r=await fetch(url,o);return r.json();
 }}
+function toggleMenu(){
+  document.querySelector('.sidebar').classList.toggle('open');
+}
 </script>{js}</body></html>"""
 
 def page(title, content, active='', js=''):
