@@ -1,0 +1,14 @@
+[Unit]
+Description=PiNAPPLE Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/pinapple
+ExecStart=/opt/pinapple/venv/bin/python3 /opt/pinapple/app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
