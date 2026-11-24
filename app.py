@@ -450,15 +450,7 @@ async function rr(){
   if(!d.length){t.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--dim)">No networks found. Click Scan.</td></tr>';return;}
   t.innerHTML=[...d].sort((a,b)=>b.signal-a.signal).map(n=>'<tr><td>'+(n.ssid||'&lt;hidden&gt;')+'</td><td><code style="font-size:0.75rem">'+(n.bssid||'')+'</code></td><td>'+(n.channel||0)+'</td><td>'+(n.signal||0)+' dBm</td><td><span class="badge '+(mc[n.encryption]||'bb')+'">'+(n.encryption||'?')+'</span></td><td style="font-size:0.75rem;color:var(--dim)">'+(n.first_seen||'')+'</td></tr>').join('');
   
-  // Update all attack dropdowns if they exist on the page
-  const selects = [document.getElementById('da-net-sel'), document.getElementById('hs-net-sel'), document.getElementById('et-net-sel'), document.getElementById('pmkid-net-sel')];
-  selects.forEach(sel => {
-    if (!sel) return;
-    const current = sel.value;
-    sel.innerHTML = '<option value="">-- manual entry --</option>' + 
-      d.map(n => `<option value="${n.bssid}">${n.ssid} (${n.bssid})</option>`).join('');
-    if (current) sel.value = current;
-  });
+  
 }
 setInterval(rr,30000);
 </script>"""
@@ -1109,16 +1101,6 @@ def wlan1_page():
     ) or '<tr><td colspan="6" style="text-align:center;color:var(--dim)">No devices seen yet — monitoring wlan1...</td></tr>'
 
     content = """
-<div class="tabs">
-  <button class="btn btn-outline" onclick="showTab('probes')" id="tab-probes">&#128246; Probe Requests ({np})</button>
-  <button class="btn btn-outline" onclick="showTab('deauth')" id="tab-deauth">&#9889; Deauth</button>
-  <button class="btn btn-outline" onclick="showTab('handshake')" id="tab-handshake">&#128400; Handshake Capture</button>
-  <button class="btn btn-outline" onclick="showTab('eviltwin')" id="tab-eviltwin">&#127917; Evil Twin</button>
-  <button class="btn btn-outline" onclick="showTab('pmkid')" id="tab-pmkid">&#128273; PMKID</button>
-  <button class="btn btn-outline" onclick="showTab('beacon')" id="tab-beacon">&#128225; Beacon Flood</button>
-  <button class="btn btn-outline" onclick="showTab('tracker')" id="tab-tracker">&#128202; Client Tracker ({nt})</button>
-</div>
-
 <!-- PROBES TAB -->
 <div id="pane-probes" class="tab-pane">
 <div id="wlan1-mode-bar" style="display:flex;align-items:center;gap:12px;margin-bottom:12px;padding:10px 14px;background:var(--bg2,#111);border-radius:8px;font-size:0.85rem;flex-wrap:wrap;">
@@ -1172,7 +1154,20 @@ def wlan1_page():
       <button class="btn btn-acc" onclick="startContinuousDeauth()" id="btn-cont-deauth-start">&#9889; Start Continuous</button>
       <button class="btn btn-outline" onclick="stopContinuousDeauth()" id="btn-cont-deauth-stop">&#9632; Stop Continuous</button>
     </div>
-    <div id="da-output" style="margin-top:12px;font-family:monospace;font-size:0.8rem;color:var(--acc);white-space:pre-wrap"></div>
+    <div id="da-output" style="margin-top:12px;font-family:monospace;font-size:0.8rem;color:var(--acc);white-space:pre-wrap">
+<div class="sh" style="margin-top:24px; border-top:1px solid var(--bdr); padding-top:16px;">
+  <span class="st">Nearby Networks (Recon)</span>
+  <button class="btn btn-acc" onclick="triggerScan()" id="scan-btn">Scan Now</button>
+</div>
+<div class="twrap">
+  <table>
+    <thead><tr><th>SSID</th><th>BSSID</th><th>Ch</th><th>Signal</th><th>Action</th></tr></thead>
+    <tbody id="scan-tbody">
+      <tr><td colspan="5" style="text-align:center;color:var(--dim)">Click Scan Now to find networks...</td></tr>
+    </tbody>
+  </table>
+</div>
+</div>
   </div>
 </div>
 
@@ -1204,7 +1199,20 @@ def wlan1_page():
       </div>
     </div>
     <button class="btn btn-accent" onclick="startHandshake()" id="hs-btn">&#128400; Start Capture</button>
-    <div id="hs-status" style="margin-top:16px;padding:12px;background:var(--bg);border-radius:8px;font-family:monospace;font-size:0.8rem;display:none"></div>
+    <div id="hs-status" style="margin-top:16px;padding:12px;background:var(--bg);border-radius:8px;font-family:monospace;font-size:0.8rem;display:none">
+<div class="sh" style="margin-top:24px; border-top:1px solid var(--bdr); padding-top:16px;">
+  <span class="st">Nearby Networks (Recon)</span>
+  <button class="btn btn-acc" onclick="triggerScan()" id="scan-btn">Scan Now</button>
+</div>
+<div class="twrap">
+  <table>
+    <thead><tr><th>SSID</th><th>BSSID</th><th>Ch</th><th>Signal</th><th>Action</th></tr></thead>
+    <tbody id="scan-tbody">
+      <tr><td colspan="5" style="text-align:center;color:var(--dim)">Click Scan Now to find networks...</td></tr>
+    </tbody>
+  </table>
+</div>
+</div>
   </div>
 </div>
 
@@ -1268,7 +1276,20 @@ def wlan1_page():
       <button class="btn btn-danger" onclick="startEvilTwin()" id="et-start">Start Evil Twin</button>
       <button class="btn btn-outline" onclick="stopEvilTwin()" id="et-stop">Stop Evil Twin</button>
     </div>
-    <div id="et-output" style="margin-top:12px;font-family:monospace;font-size:0.8rem;"></div>
+    <div id="et-output" style="margin-top:12px;font-family:monospace;font-size:0.8rem;">
+<div class="sh" style="margin-top:24px; border-top:1px solid var(--bdr); padding-top:16px;">
+  <span class="st">Nearby Networks (Recon)</span>
+  <button class="btn btn-acc" onclick="triggerScan()" id="scan-btn">Scan Now</button>
+</div>
+<div class="twrap">
+  <table>
+    <thead><tr><th>SSID</th><th>BSSID</th><th>Ch</th><th>Signal</th><th>Action</th></tr></thead>
+    <tbody id="scan-tbody">
+      <tr><td colspan="5" style="text-align:center;color:var(--dim)">Click Scan Now to find networks...</td></tr>
+    </tbody>
+  </table>
+</div>
+</div>
   </div>
 </div>
 
@@ -1286,7 +1307,20 @@ def wlan1_page():
       <button class="btn btn-danger" onclick="startPmkid()">Start PMKID</button>
       <button class="btn btn-outline" onclick="stopPmkid()">Stop &amp; Convert</button>
     </div>
-    <div id="pmkid-output" style="margin-top:12px;font-family:monospace;font-size:0.8rem;"></div>
+    <div id="pmkid-output" style="margin-top:12px;font-family:monospace;font-size:0.8rem;">
+<div class="sh" style="margin-top:24px; border-top:1px solid var(--bdr); padding-top:16px;">
+  <span class="st">Nearby Networks (Recon)</span>
+  <button class="btn btn-acc" onclick="triggerScan()" id="scan-btn">Scan Now</button>
+</div>
+<div class="twrap">
+  <table>
+    <thead><tr><th>SSID</th><th>BSSID</th><th>Ch</th><th>Signal</th><th>Action</th></tr></thead>
+    <tbody id="scan-tbody">
+      <tr><td colspan="5" style="text-align:center;color:var(--dim)">Click Scan Now to find networks...</td></tr>
+    </tbody>
+  </table>
+</div>
+</div>
   </div>
 </div>
 
@@ -1306,13 +1340,7 @@ def wlan1_page():
     )
 
     js = r"""<script>
-function showTab(name) {
-  document.querySelectorAll('.tab-pane').forEach(p => p.style.display='none');
-  document.getElementById('pane-'+name).style.display='';
-  document.querySelectorAll('[id^="tab-"]').forEach(b => { b.classList.remove('btn-acc'); b.classList.add('btn-outline'); });
-  const btn = document.getElementById('tab-'+name);
-  if (btn) { btn.classList.remove('btn-outline'); btn.classList.add('btn-acc'); }
-}
+
 
 if (typeof refreshWlan1Mode === 'function') refreshWlan1Mode();
 
@@ -1342,7 +1370,7 @@ async function setWlan1Mode(mode) {
   }
   refreshWlan1Mode();
 }
-showTab('probes');
+
 
 function fillBssid(v) { if(v) document.getElementById('da-bssid').value=v; }
 function fillHsBssid(v) {
@@ -1618,6 +1646,39 @@ async function stopPmkid() {
     out.textContent = 'Error: ' + (r.error || 'Unknown error');
     out.style.color = 'var(--red)';
   }
+}
+
+async function triggerScan() {
+  const btn = document.getElementById('scan-btn');
+  btn.textContent = 'Scanning...'; btn.disabled = true;
+  await fetch('/api/recon/scan', {method:'POST'});
+  updateScanTable();
+  btn.textContent = 'Scan Now'; btn.disabled = false;
+}
+
+function updateScanTable() {
+  fetch('/api/recon').then(r=>r.json()).then(d => {
+    const t = document.getElementById('scan-tbody');
+    if (!t) return;
+    if (!d.length) { t.innerHTML = '<tr><td colspan="5" style="text-align:center">No networks found.</td></tr>'; return; }
+    t.innerHTML = d.map(n => `
+      <tr>
+        <td>${n.ssid || '&lt;hidden&gt;'}</td>
+        <td><code>${n.bssid}</code></td>
+        <td>${n.channel}</td>
+        <td>${n.signal} dBm</td>
+        <td><button class="btn btn-outline" style="padding:4px 8px;font-size:0.7rem;" onclick="selectTarget('${n.bssid}', '${n.ssid}', '${n.channel}')">Select</button></td>
+      </tr>
+    `).join('');
+  });
+}
+
+function selectTarget(bssid, ssid, channel) {
+  const active = new URLSearchParams(window.location.search).get('tab') || 'probes';
+  if (active === 'deauth') { document.getElementById('da-bssid').value = bssid; }
+  else if (active === 'handshake') { document.getElementById('hs-bssid').value = bssid; document.getElementById('hs-channel').value = channel; }
+  else if (active === 'eviltwin') { document.getElementById('et-bssid').value = bssid; document.getElementById('et-ssid').value = ssid; document.getElementById('et-channel').value = channel; }
+  alert('Target selected: ' + (ssid || bssid));
 }
 </script>"""
 
