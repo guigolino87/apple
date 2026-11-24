@@ -156,22 +156,30 @@ NAV = """<aside class="sidebar">
   <div class="sidebar-logo"><div class="logo-icon">&#127821;</div>
     <div><div class="logo-text">PiNAPPLE</div><div class="logo-sub">WiFi Audit Platform</div></div>
   </div>
-  <nav>
-    <a href="/" class="{ov}"><span class="nav-icon">&#9711;</span> Overview</a>
-    <a href="/clients" class="{cl}"><span class="nav-icon">&#11042;</span> Clients</a>
-    <a href="/recon" class="{re}"><span class="nav-icon">&#10792;</span> Recon</a>
-    <a href="/creds" class="{cr}"><span class="nav-icon">&#8853;</span> Credentials</a>
-    <a href="/ap-control" class="{ap}"><span class="nav-icon">&#10774;</span> AP Control</a>
-    <a href="/logs" class="{lo}"><span class="nav-icon">&#8801;</span> Logs</a>
-    <a href="/wlan1" class="{wl}"><span class="nav-icon">&#9889;</span> WLAN1 Attacks</a>
-    <a href="/settings" class="{se}"><span class="nav-icon">&#9881;</span> Settings</a>
+  <nav style="padding:12px 0; flex:1; overflow-y:auto;">
+    <div style="padding: 8px 20px; font-size: 0.7rem; color: var(--dim); text-transform: uppercase; letter-spacing: 1px;">Dashboard</div>
+    <a href="/" class="{ov}">📊 Overview</a>
+    <a href="/clients" class="{cl}">👥 Clients</a>
+    <a href="/recon" class="{re}">📡 Recon</a>
+    <a href="/creds" class="{cr}">🔑 Credentials</a>
+    <a href="/logs" class="{lo}">📝 Logs</a>
+    <a href="/ap-control" class="{ap}">📶 AP Control</a>
+    <a href="/settings" class="{se}">⚙️ Settings</a>
+
+    <div style="padding: 8px 20px; font-size: 0.7rem; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin-top: 10px;">Wireless Tools</div>
+    <a href="/wlan1?tab=deauth" class="{da}">⚡ Deauth</a>
+    <a href="/wlan1?tab=handshake" class="{hs}">🖐️ Handshake</a>
+    <a href="/wlan1?tab=eviltwin" class="{et}">🎭 Evil Twin</a>
+    <a href="/wlan1?tab=pmkid" class="{pm}">🔑 PMKID</a>
+    <a href="/wlan1?tab=beacon" class="{bf}">📡 Beacon Flood</a>
+    <a href="/wlan1?tab=tracker" class="{tr}">📊 Client Tracker</a>
+    <a href="/wlan1?tab=probes" class="{pr}">📶 Probe Requests</a>
   </nav>
   <div class="sidebar-footer">admin@pinapple</div>
 </aside>"""
 
 CSS = """<style>
-:root{--bg:#0d0d1a;--sb:#12122a;--card:#1a1a35;--bdr:#2a2a4a;--acc:#00d4aa;--acc2:#0099ff;
-  --danger:#ff4757;--warn:#ffa502;--txt:#e0e0e0;--dim:#888;--grn:#2ed573;--red:#ff4757}
+:root{--bg:#000000;--sb:#0a0a0a;--card:#141414;--bdr:#2a2a2a;--acc:#00d4aa;--acc2:#0099ff;--danger:#ff4757;--warn:#ffa502;--txt:#ffffff;--dim:#888888;--grn:#2ed573;--red:#ff4757}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',monospace;background:var(--bg);color:var(--txt);display:flex;min-height:100vh}
 .sidebar{width:240px;background:var(--sb);border-right:1px solid var(--bdr);display:flex;flex-direction:column;position:fixed;height:100vh;overflow-y:auto;z-index:100}
@@ -262,8 +270,8 @@ function toggleMenu(){{
 </script>{js}</body></html>"""
 
 def page(title, content, active='', js=''):
-    acts = {k: '' for k in ['ov','cl','re','cr','ap','lo','se','wl']}
-    m = {'overview':'ov','clients':'cl','recon':'re','creds':'cr','ap':'ap','logs':'lo','settings':'se','wl':'wl'}
+    acts = {k: '' for k in ['ov','cl','re','cr','ap','lo','se','da','hs','et','pm','bf','tr','pr']}
+    m = {'overview':'ov','clients':'cl','recon':'re','creds':'cr','ap':'ap','logs':'lo','settings':'se','wl':'da','deauth':'da','handshake':'hs','eviltwin':'et','pmkid':'pm','beacon':'bf','tracker':'tr','probes':'pr'}
     if active in m:
         acts[m[active]] = 'active'
     return BASE.format(title=title, css=CSS, nav=NAV.format(**acts), content=content, js=js)
@@ -274,7 +282,11 @@ def overview():
     ap_ok = service_status('pinapple-ap')
     dhcp_ok = service_status('pinapple-dhcp')
     ng_ok = service_status('nginx')
-    mon_ok = monitor_mode_active()
+    try:
+        r = subprocess.run(['ip', 'link', 'show', 'wlan1'], capture_output=True, text=True)
+        mon_ok = r.returncode == 0 and 'UP' in r.stdout
+    except:
+        mon_ok = False
     clients = get_clients()
     i_on = os.path.exists(FLAG_INTERNET)
     d_on = os.path.exists(FLAG_DNS)
@@ -332,7 +344,7 @@ def overview():
         pc='ton' if p_on else 'toff', pt='ON' if p_on else 'OFF',
         eip=eth_ip,
         apb='bg' if ap_ok else 'br', aps='AP' if ap_ok else 'DOWN',
-        mnb='bb' if mon_ok else 'br', mns='MONITOR' if mon_ok else 'DOWN')
+        mnb='bb' if mon_ok else 'br', mns='READY' if mon_ok else 'DOWN')
 
     js = """<script>
 async function tog(f,btn){
@@ -1609,7 +1621,7 @@ async function stopPmkid() {
 }
 </script>"""
 
-    return page('WLAN1 Attacks', content, 'wl', js)
+    return page('WLAN1 Attacks', content, request.args.get('tab', 'probes'), js)
 
 
 if __name__ == '__main__':
