@@ -256,9 +256,9 @@ async function api(url,method,body){{
   if(body)o.body=JSON.stringify(body);
   const r=await fetch(url,o);return r.json();
 }}
-function toggleMenu(){
+function toggleMenu(){{
   document.querySelector('.sidebar').classList.toggle('open');
-}
+}}
 </script>{js}</body></html>"""
 
 def page(title, content, active='', js=''):
