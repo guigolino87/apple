@@ -1072,8 +1072,8 @@ def wlan1_page():
 </div>
 """
 
-    content = f"""
-<div id="pane-probes" style="display: {'block' if active_tab == 'probes' else 'none'}">
+    content = """
+<div id="pane-probes" style="display: {d_probes}">
 <div id="wlan1-mode-bar" style="display:flex;align-items:center;gap:12px;margin-bottom:12px;padding:10px 14px;background:var(--bg2,#111);border-radius:8px;font-size:0.85rem;flex-wrap:wrap;">
   <span>wlan1 mode:</span>
   <span id="wlan1-mode-badge" style="padding:2px 10px;border-radius:12px;background:#555;color:#fff;font-weight:bold;">...</span>
@@ -1091,7 +1091,7 @@ def wlan1_page():
   </table></div>
 </div>
 
-<div id="pane-deauth" style="display: {'block' if active_tab == 'deauth' else 'none'}">
+<div id="pane-deauth" style="display: {d_deauth}">
   <div class="sh"><span class="st">Deauthentication Attack</span>
     <span style="color:var(--warn);font-size:0.75rem">&#9888; Authorized networks only</span></div>
   <div class="card" style="max-width:600px">
@@ -1123,7 +1123,7 @@ def wlan1_page():
   {scan_table}
 </div>
 
-<div id="pane-handshake" style="display: {'block' if active_tab == 'handshake' else 'none'}">
+<div id="pane-handshake" style="display: {d_handshake}">
   <div class="sh"><span class="st">WPA2 Handshake Capture</span>
     <span style="color:var(--warn);font-size:0.75rem">&#9888; Authorized networks only</span></div>
   <div class="card" style="max-width:600px">
@@ -1155,7 +1155,7 @@ def wlan1_page():
   {scan_table}
 </div>
 
-<div id="pane-beacon" style="display: {'block' if active_tab == 'beacon' else 'none'}">
+<div id="pane-beacon" style="display: {d_beacon}">
   <div class="sh"><span class="st">Beacon Flood</span>
     <span style="color:var(--warn);font-size:0.75rem">&#9888; Authorized lab use only</span></div>
   <div style="display:grid;grid-template-columns:1fr;gap:16px">
@@ -1184,7 +1184,7 @@ def wlan1_page():
   </div>
 </div>
 
-<div id="pane-eviltwin" style="display: {'block' if active_tab == 'eviltwin' else 'none'}">
+<div id="pane-eviltwin" style="display: {d_eviltwin}">
   <div class="sh"><span class="st">Evil Twin Attack</span></div>
   <div class="card">
     <div class="card-title">Target Network</div>
@@ -1218,7 +1218,7 @@ def wlan1_page():
   {scan_table}
 </div>
 
-<div id="pane-pmkid" style="display: {'block' if active_tab == 'pmkid' else 'none'}">
+<div id="pane-pmkid" style="display: {d_pmkid}">
   <div class="sh"><span class="st">PMKID Capture</span></div>
   <div class="card">
     <div class="fg">
@@ -1236,15 +1236,26 @@ def wlan1_page():
   {scan_table}
 </div>
 
-<div id="pane-tracker" style="display: {'block' if active_tab == 'tracker' else 'none'}">
-  <div class="sh"><span class="st">All Devices Seen on wlan1 ({len(tracker)} total)</span>
+<div id="pane-tracker" style="display: {d_tracker}">
+  <div class="sh"><span class="st">All Devices Seen on wlan1 ({nt} total)</span>
     <span style="font-size:0.75rem;color:var(--dim)">Auto-refresh 10s</span></div>
   <div class="twrap"><table>
     <thead><tr><th>MAC Address</th><th>First Seen</th><th>Last Seen</th><th>Packet Types</th><th>Probed SSIDs</th><th>Pkts</th></tr></thead>
     <tbody id="tracker-tbody">{tracker_rows}</tbody>
   </table></div>
 </div>
-"""
+""".format(
+        d_probes='block' if active_tab == 'probes' else 'none',
+        d_deauth='block' if active_tab == 'deauth' else 'none',
+        d_handshake='block' if active_tab == 'handshake' else 'none',
+        d_beacon='block' if active_tab == 'beacon' else 'none',
+        d_eviltwin='block' if active_tab == 'eviltwin' else 'none',
+        d_pmkid='block' if active_tab == 'pmkid' else 'none',
+        d_tracker='block' if active_tab == 'tracker' else 'none',
+        nt=len(tracker),
+        probe_rows=probe_rows, tracker_rows=tracker_rows,
+        net_opts=net_opts, scan_table=scan_table
+    )
 
     js = r"""<script>
 if (typeof refreshWlan1Mode === 'function') refreshWlan1Mode();
