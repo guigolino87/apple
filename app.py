@@ -1592,3 +1592,8 @@ function selectTarget(bssid, ssid, channel) {
 </script>"""
 
     return page('WLAN1 Attacks', content, request.args.get('tab', 'probes'), js)
+
+if __name__ == '__main__':
+    os.makedirs('/var/log/pinapple', exist_ok=True)
+    os.makedirs('/etc/pinapple', exist_ok=True)
+    app.run(host='0.0.0.0', port=8080, debug=False)
