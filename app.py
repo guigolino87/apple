@@ -1010,51 +1010,6 @@ def api_evil_twin_start():
     
     return jsonify({'ok': True})
 
-@app.route('/api/wlan1/evil-twin/stop', methods=['POST'])
-@require_auth
-def api_evil_twin_stop():
-    if _evil_twin_job[0] is not None:
-        try:
-            os.killpg(os.getpgid(_evil_twin_job[0].pid), signal.SIGTERM)
-        except:
-            pass
-    
-    subprocess.run(['systemctl', 'stop', 'pinapple-ap'], capture_output=True)
-    subprocess.run(['ip', 'link', 'set', 'wlan0', 'down'], capture_output=True)
-    subprocess.run(['macchanger', '-r', 'wlan0'], capture_output=True)
-    subprocess.run(['ip', 'link', 'set', 'wlan0', 'up'], capture_output=True)
-    write_hostapd_conf('PiNAPPLE', 6, 'open', None)
-    subprocess.run(['systemctl', 'start', 'pinapple-ap'], capture_output=True)
-    
-    _evil_twin_job[0] = None
-    try:
-        set_wlan1_mode('managed')
-    except Exception:
-        pass
-
-    return jsonify({'ok': True})
-
-@app.route('/api/wlan1/mode', methods=['GET'])
-@require_auth
-def api_wlan1_mode_get():
-    return jsonify({
-        'mode': get_wlan1_mode(),
-        'ip': (subprocess.run(['ip','-4','-o','addr','show','wlan1'], capture_output=True, text=True).stdout.strip() or None)
-    })
-
-@app.route('/api/wlan1/mode', methods=['POST'])
-@require_auth
-def api_wlan1_mode_set():
-    data = request.get_json(silent=True) or {}
-    target = data.get('mode', '').lower()
-    if target not in ('managed', 'monitor'):
-        return jsonify({'ok': False, 'error': "mode must be 'managed' or 'monitor'"}), 400
-    ok, msg = set_wlan1_mode(target)
-    return jsonify({'ok': ok, 'message': msg, 'mode': get_wlan1_mode()})
-
-
-# ---- WLAN1 PAGE ----
-
 @app.route('/wlan1')
 @require_auth
 def wlan1_page():
@@ -1100,9 +1055,25 @@ def wlan1_page():
         for t in tracker[:100]
     ) or '<tr><td colspan="6" style="text-align:center;color:var(--dim)">No devices seen yet — monitoring wlan1...</td></tr>'
 
-    content = """
-<!-- PROBES TAB -->
-<div id="pane-probes" class="tab-pane">
+    active_tab = request.args.get('tab', 'probes')
+
+    scan_table = """
+<div class="sh" style="margin-top:24px; border-top:1px solid var(--bdr); padding-top:16px;">
+  <span class="st">Nearby Networks (Recon)</span>
+  <button class="btn btn-acc" onclick="triggerScan()" id="scan-btn">Scan Now</button>
+</div>
+<div class="twrap">
+  <table>
+    <thead><tr><th>SSID</th><th>BSSID</th><th>Ch</th><th>Signal</th><th>Action</th></tr></thead>
+    <tbody id="scan-tbody">
+      <tr><td colspan="5" style="text-align:center;color:var(--dim)">Click Scan Now to find networks...</td></tr>
+    </tbody>
+  </table>
+</div>
+"""
+
+    content = f"""
+<div id="pane-probes" style="display: {'block' if active_tab == 'probes' else 'none'}">
 <div id="wlan1-mode-bar" style="display:flex;align-items:center;gap:12px;margin-bottom:12px;padding:10px 14px;background:var(--bg2,#111);border-radius:8px;font-size:0.85rem;flex-wrap:wrap;">
   <span>wlan1 mode:</span>
   <span id="wlan1-mode-badge" style="padding:2px 10px;border-radius:12px;background:#555;color:#fff;font-weight:bold;">...</span>
@@ -1120,17 +1091,14 @@ def wlan1_page():
   </table></div>
 </div>
 
-<!-- DEAUTH TAB -->
-<div id="pane-deauth" class="tab-pane" style="display:none">
+<div id="pane-deauth" style="display: {'block' if active_tab == 'deauth' else 'none'}">
   <div class="sh"><span class="st">Deauthentication Attack</span>
     <span style="color:var(--warn);font-size:0.75rem">&#9888; Authorized networks only</span></div>
   <div class="card" style="max-width:600px">
     <div class="fr">
       <div class="fg">
         <label>Target AP (BSSID)</label>
-        <select id="da-net-sel" onchange="fillBssid(this.value)" style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:10px 14px;border-radius:8px;font-size:0.875rem">
-          {net_opts}
-        </select>
+        <input id="da-bssid" placeholder="AA:BB:CC:DD:EE:FF" style="text-transform:uppercase">
       </div>
       <div class="fg">
         <label>AP BSSID (manual)</label>
@@ -1154,33 +1122,20 @@ def wlan1_page():
       <button class="btn btn-acc" onclick="startContinuousDeauth()" id="btn-cont-deauth-start">&#9889; Start Continuous</button>
       <button class="btn btn-outline" onclick="stopContinuousDeauth()" id="btn-cont-deauth-stop">&#9632; Stop Continuous</button>
     </div>
-    <div id="da-output" style="margin-top:12px;font-family:monospace;font-size:0.8rem;color:var(--acc);white-space:pre-wrap">
-<div class="sh" style="margin-top:24px; border-top:1px solid var(--bdr); padding-top:16px;">
-  <span class="st">Nearby Networks (Recon)</span>
-  <button class="btn btn-acc" onclick="triggerScan()" id="scan-btn">Scan Now</button>
-</div>
-<div class="twrap">
-  <table>
-    <thead><tr><th>SSID</th><th>BSSID</th><th>Ch</th><th>Signal</th><th>Action</th></tr></thead>
-    <tbody id="scan-tbody">
-      <tr><td colspan="5" style="text-align:center;color:var(--dim)">Click Scan Now to find networks...</td></tr>
-    </tbody>
-  </table>
-</div>
-</div>
+    <div id="da-output" style="margin-top:12px;font-family:monospace;font-size:0.8rem;color:var(--acc);white-space:pre-wrap"></div>
   </div>
+  {scan_table}
 </div>
 
-<!-- HANDSHAKE TAB -->
-<div id="pane-handshake" class="tab-pane" style="display:none">
+<div id="pane-handshake" style="display: {'block' if active_tab == 'handshake' else 'none'}">
   <div class="sh"><span class="st">WPA2 Handshake Capture</span>
     <span style="color:var(--warn);font-size:0.75rem">&#9888; Authorized networks only</span></div>
   <div class="card" style="max-width:600px">
     <div class="fr">
       <div class="fg">
         <label>Target AP (from recon)</label>
-        <select id="hs-net-sel" onchange="fillHsBssid(this.value)" style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:10px 14px;border-radius:8px;font-size:0.875rem">
-          {net_opts2}
+        <select id="hs-net-sel" style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:10px 14px;border-radius:8px;font-size:0.875rem">
+          {net_opts}
         </select>
       </div>
       <div class="fg">
@@ -1199,25 +1154,12 @@ def wlan1_page():
       </div>
     </div>
     <button class="btn btn-accent" onclick="startHandshake()" id="hs-btn">&#128400; Start Capture</button>
-    <div id="hs-status" style="margin-top:16px;padding:12px;background:var(--bg);border-radius:8px;font-family:monospace;font-size:0.8rem;display:none">
-<div class="sh" style="margin-top:24px; border-top:1px solid var(--bdr); padding-top:16px;">
-  <span class="st">Nearby Networks (Recon)</span>
-  <button class="btn btn-acc" onclick="triggerScan()" id="scan-btn">Scan Now</button>
-</div>
-<div class="twrap">
-  <table>
-    <thead><tr><th>SSID</th><th>BSSID</th><th>Ch</th><th>Signal</th><th>Action</th></tr></thead>
-    <tbody id="scan-tbody">
-      <tr><td colspan="5" style="text-align:center;color:var(--dim)">Click Scan Now to find networks...</td></tr>
-    </tbody>
-  </table>
-</div>
-</div>
+    <div id="hs-status" style="margin-top:16px;padding:12px;background:var(--bg);border-radius:8px;font-family:monospace;font-size:0.8rem;display:none"></div>
   </div>
+  {scan_table}
 </div>
 
-<!-- BEACON FLOOD TAB -->
-<div id="pane-beacon" class="tab-pane" style="display:none">
+<div id="pane-beacon" style="display: {'block' if active_tab == 'beacon' else 'none'}">
   <div class="sh"><span class="st">Beacon Flood</span>
     <span style="color:var(--warn);font-size:0.75rem">&#9888; Authorized lab use only</span></div>
   <div style="display:grid;grid-template-columns:1fr;gap:16px">
@@ -1246,8 +1188,7 @@ def wlan1_page():
   </div>
 </div>
 
-<!-- EVIL TWIN TAB -->
-<div id="pane-eviltwin" class="tab-pane" style="display:none">
+<div id="pane-eviltwin" style="display: {'block' if active_tab == 'eviltwin' else 'none'}">
   <div class="sh"><span class="st">Evil Twin Attack</span></div>
   <div class="card">
     <div class="card-title">Target Network</div>
@@ -1276,25 +1217,12 @@ def wlan1_page():
       <button class="btn btn-danger" onclick="startEvilTwin()" id="et-start">Start Evil Twin</button>
       <button class="btn btn-outline" onclick="stopEvilTwin()" id="et-stop">Stop Evil Twin</button>
     </div>
-    <div id="et-output" style="margin-top:12px;font-family:monospace;font-size:0.8rem;">
-<div class="sh" style="margin-top:24px; border-top:1px solid var(--bdr); padding-top:16px;">
-  <span class="st">Nearby Networks (Recon)</span>
-  <button class="btn btn-acc" onclick="triggerScan()" id="scan-btn">Scan Now</button>
-</div>
-<div class="twrap">
-  <table>
-    <thead><tr><th>SSID</th><th>BSSID</th><th>Ch</th><th>Signal</th><th>Action</th></tr></thead>
-    <tbody id="scan-tbody">
-      <tr><td colspan="5" style="text-align:center;color:var(--dim)">Click Scan Now to find networks...</td></tr>
-    </tbody>
-  </table>
-</div>
-</div>
+    <div id="et-output" style="margin-top:12px;font-family:monospace;font-size:0.8rem;"></div>
   </div>
+  {scan_table}
 </div>
 
-<!-- PMKID TAB -->
-<div id="pane-pmkid" class="tab-pane" style="display:none">
+<div id="pane-pmkid" style="display: {'block' if active_tab == 'pmkid' else 'none'}">
   <div class="sh"><span class="st">PMKID Capture</span></div>
   <div class="card">
     <div class="fg">
@@ -1307,41 +1235,22 @@ def wlan1_page():
       <button class="btn btn-danger" onclick="startPmkid()">Start PMKID</button>
       <button class="btn btn-outline" onclick="stopPmkid()">Stop &amp; Convert</button>
     </div>
-    <div id="pmkid-output" style="margin-top:12px;font-family:monospace;font-size:0.8rem;">
-<div class="sh" style="margin-top:24px; border-top:1px solid var(--bdr); padding-top:16px;">
-  <span class="st">Nearby Networks (Recon)</span>
-  <button class="btn btn-acc" onclick="triggerScan()" id="scan-btn">Scan Now</button>
-</div>
-<div class="twrap">
-  <table>
-    <thead><tr><th>SSID</th><th>BSSID</th><th>Ch</th><th>Signal</th><th>Action</th></tr></thead>
-    <tbody id="scan-tbody">
-      <tr><td colspan="5" style="text-align:center;color:var(--dim)">Click Scan Now to find networks...</td></tr>
-    </tbody>
-  </table>
-</div>
-</div>
+    <div id="pmkid-output" style="margin-top:12px;font-family:monospace;font-size:0.8rem;"></div>
   </div>
+  {scan_table}
 </div>
 
-<!-- TRACKER TAB -->
-<div id="pane-tracker" class="tab-pane" style="display:none">
-  <div class="sh"><span class="st">All Devices Seen on wlan1 ({nt} total)</span>
+<div id="pane-tracker" style="display: {'block' if active_tab == 'tracker' else 'none'}">
+  <div class="sh"><span class="st">All Devices Seen on wlan1 ({len(tracker)} total)</span>
     <span style="font-size:0.75rem;color:var(--dim)">Auto-refresh 10s</span></div>
   <div class="twrap"><table>
     <thead><tr><th>MAC Address</th><th>First Seen</th><th>Last Seen</th><th>Packet Types</th><th>Probed SSIDs</th><th>Pkts</th></tr></thead>
     <tbody id="tracker-tbody">{tracker_rows}</tbody>
   </table></div>
 </div>
-""".format(
-        np=len(probes), nt=len(tracker),
-        probe_rows=probe_rows, tracker_rows=tracker_rows,
-        net_opts=net_opts, net_opts2=net_opts,
-    )
+"""
 
     js = r"""<script>
-
-
 if (typeof refreshWlan1Mode === 'function') refreshWlan1Mode();
 
 async function refreshWlan1Mode() {
@@ -1369,13 +1278,6 @@ async function setWlan1Mode(mode) {
     alert('Mode switch error: ' + e);
   }
   refreshWlan1Mode();
-}
-
-
-function fillBssid(v) { if(v) document.getElementById('da-bssid').value=v; }
-function fillHsBssid(v) {
-  if (!v) return;
-  document.getElementById('hs-bssid').value = v;
 }
 
 async function fireDeauth() {
@@ -1434,7 +1336,6 @@ async function startHandshake() {
 async function startFlood() {
   const ssid = document.getElementById('bf-ssid').value.trim();
   const count = parseInt(document.getElementById('bf-count').value);
-
   const st = document.getElementById('bf-status');
   const startBtn = document.getElementById('bf-start');
   const stopBtn = document.getElementById('bf-stop');
@@ -1650,6 +1551,7 @@ async function stopPmkid() {
 
 async function triggerScan() {
   const btn = document.getElementById('scan-btn');
+  if(!btn) return;
   btn.textContent = 'Scanning...'; btn.disabled = true;
   await fetch('/api/recon/scan', {method:'POST'});
   updateScanTable();
@@ -1683,9 +1585,3 @@ function selectTarget(bssid, ssid, channel) {
 </script>"""
 
     return page('WLAN1 Attacks', content, request.args.get('tab', 'probes'), js)
-
-
-if __name__ == '__main__':
-    os.makedirs('/var/log/pinapple', exist_ok=True)
-    os.makedirs('/etc/pinapple', exist_ok=True)
-    app.run(host='0.0.0.0', port=8080, debug=False)
