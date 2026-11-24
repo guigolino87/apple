@@ -1055,7 +1055,7 @@ def wlan1_page():
 <div style="margin-bottom:16px;display:flex;gap:8px;border-bottom:1px solid var(--bdr);padding-bottom:12px">
   <button class="btn btn-outline" onclick="showTab('probes')" id="tab-probes">&#128246; Probe Requests ({np})</button>
   <button class="btn btn-outline" onclick="showTab('deauth')" id="tab-deauth">&#9889; Deauth</button>
-  <button class="btn btn-outline" onclick="showTab('handshake')" id="tab-handshake">&#128握; Handshake Capture</button>
+  <button class="btn btn-outline" onclick="showTab('handshake')" id="tab-handshake">&#128400; Handshake Capture</button>
   <button class="btn btn-outline" onclick="showTab('eviltwin')" id="tab-eviltwin">&#127917; Evil Twin</button>
   <button class="btn btn-outline" onclick="showTab('pmkid')" id="tab-pmkid">&#128273; PMKID</button>
   <button class="btn btn-outline" onclick="showTab('beacon')" id="tab-beacon">&#128225; Beacon Flood</button>
@@ -1342,6 +1342,13 @@ async function startHandshake() {
 async function startFlood() {
   const ssid = document.getElementById('bf-ssid').value.trim();
   const count = parseInt(document.getElementById('bf-count').value);
+
+  const st = document.getElementById('bf-status');
+  const startBtn = document.getElementById('bf-start');
+  const stopBtn = document.getElementById('bf-stop');
+  startBtn.disabled = true;
+  st.textContent = 'Starting...';
+  st.style.color = 'var(--warn)';
   
   if (!ssid) { 
     alert('Enter a base SSID name'); 
@@ -1354,30 +1361,51 @@ async function startFlood() {
   }
   
   const r = await api('/api/wlan1/beacon-flood/start', 'POST', {ssid, count});
-  const st = document.getElementById('bf-status');
+
   if (r.ok) {
-    st.textContent = 'Flooding ' + r.ssid_count + ' SSIDs (PID ' + r.pid + ')';
-    st.style.color = 'var(--red)';
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    // Start polling every 2 seconds
+    if (window.bfPoll) clearInterval(window.bfPoll);
+    window.bfPoll = setInterval(updateBeaconStatus, 2000);
   } else {
-    st.textContent = 'Error: ' + r.error;
+    startBtn.disabled = false;
+    stopBtn.disabled = false;
+    st.textContent = 'Error: ' + (r.error || 'Unknown');
+    st.style.color = 'var(--red)';
   }
   updateBeaconStatus();
 }
 
 async function stopFlood() {
+  if (window.bfPoll) clearInterval(window.bfPoll);
+  const startBtn = document.getElementById('bf-start');
+  const stopBtn = document.getElementById('bf-stop');
+  
+  startBtn.disabled = true;
+  stopBtn.disabled = true;
+
   const r = await api('/api/wlan1/beacon-flood/stop', 'POST');
+  
   document.getElementById('bf-status').textContent = 'Stopped.';
   document.getElementById('bf-status').style.color = 'var(--dim)';
   document.getElementById('bf-active-ssids').innerHTML = '';
+  
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
 }
 
 async function updateBeaconStatus() {
   const r = await fetch('/api/wlan1/beacon-flood/status');
   const d = await r.json();
   const st = document.getElementById('bf-status');
+  const startBtn = document.getElementById('bf-start');
+  const stopBtn = document.getElementById('bf-stop');
   if (d.running) {
     st.textContent = 'ACTIVE — flooding ' + (d.ssids||[]).length + ' SSIDs (PID ' + d.pid + ')';
     st.style.color = 'var(--red)';
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
     document.getElementById('bf-active-ssids').innerHTML =
       '<div style="font-size:0.75rem;color:var(--dim);margin-top:4px">' +
       (d.ssids||[]).map(s=>'<span class="badge bb" style="margin:2px">'+s+'</span>').join(' ') + '</div>';
@@ -1385,6 +1413,9 @@ async function updateBeaconStatus() {
     st.textContent = 'Idle';
     st.style.color = 'var(--dim)';
     document.getElementById('bf-active-ssids').innerHTML = '';
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    if (window.bfPoll) clearInterval(window.bfPoll);
   }
 }
 updateBeaconStatus();
