@@ -1101,15 +1101,11 @@ def wlan1_page():
         <input id="da-bssid" placeholder="AA:BB:CC:DD:EE:FF" style="text-transform:uppercase">
       </div>
       <div class="fg">
-        <label>AP BSSID (manual)</label>
-        <input id="da-bssid" placeholder="AA:BB:CC:DD:EE:FF" style="text-transform:uppercase">
-      </div>
-    </div>
-    <div class="fr">
-      <div class="fg">
         <label>Client MAC (FF:FF:FF:FF:FF:FF = broadcast)</label>
         <input id="da-client" value="FF:FF:FF:FF:FF:FF" style="text-transform:uppercase">
       </div>
+    </div>
+    <div class="fr">
       <div class="fg">
         <label>Burst Count: <span id="da-count-label">64</span></label>
         <input type="range" id="da-count" min="10" max="500" value="64"
