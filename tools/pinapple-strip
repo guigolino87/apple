@@ -379,17 +379,26 @@ def passthrough_on(gw):
 
 
 def blocked_tls_count():
-    """Sum the packet counters of our https REJECT rules."""
+    """Sum the packet counters of our https REJECT rules.
+
+    iptables prints the port as 'dpt:https' on some builds and 'dpt:443' on
+    others, so match both — otherwise the dashboard always reports zero.
+    """
     try:
         out = iptables(['-vnL', 'FORWARD']).stdout
     except (OSError, subprocess.SubprocessError):
         return 0
     total = 0
     for line in out.splitlines():
-        if 'dpt:https' in line and 'REJECT' in line:
-            parts = line.split()
-            if parts and parts[0].isdigit():
-                total += int(parts[0])
+        parts = line.split()
+        if 'REJECT' not in parts:
+            continue
+        if 'dpt:https' not in line and 'dpt:443' not in line:
+            continue
+        # "pkts bytes target prot ...", optionally prefixed by "--line-numbers".
+        index = parts.index('REJECT')
+        if index >= 2 and parts[index - 2].isdigit():
+            total += int(parts[index - 2])
     return total
 
 

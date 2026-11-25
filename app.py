@@ -2954,6 +2954,9 @@ query string, cookies, form fields and Basic-auth header are logged as plain tex
 <strong>What it cannot see.</strong> Traffic a phone forces to HTTPS by itself (HSTS preload,
 Chrome's &ldquo;Always use secure connections&rdquo;, a typed https:// URL) never reaches the proxy:
 it dies at the 443 block and only increments <em>TLS refused</em>.
+<strong>This is not the DNS log.</strong> System Logs &rarr; dnsmasq shows every <em>name lookup</em>
+from every client; that only proves a device asked where a host is. Only rows in the two
+tables below prove that bytes actually crossed the proxy.
 </div></div>
 
 <div class="sh"><span class="st">Captured requests</span>
@@ -2973,10 +2976,11 @@ it dies at the 443 block and only increments <em>TLS refused</em>.
 <div class="hint" style="margin:0;line-height:1.6">
 <strong>Demo checklist.</strong> Use a phone that has never visited the test site (or clear
 site data), turn off Chrome's &ldquo;Always use secure connections&rdquo;, and prefer domains that
-are not on the HSTS preload list. The first visit to an HTTPS-only site costs one extra
+are not on the HSTS preload list. A device with a second route &mdash; cellular data, Ethernet,
+another Wi-Fi network or a VPN &mdash; carries its web traffic around the Pi entirely, so
+turn those off before recording. The first visit to an HTTPS-only site costs one extra
 request: the plain request is answered with a rewritten 301, then the page is fetched
-over TLS and returned as http. Sites that answer plain HTTP directly, and those that
-refuse to downgrade at all, show up in the two tables above.
+over TLS and returned as http.
 </div></div>""".format(
         mb=mode_block, ma=mode_allow, tcls=toggle_cls, tlabel=toggle_label,
         on='1' if running else '0', dot=dot, running=running_txt, port=port,

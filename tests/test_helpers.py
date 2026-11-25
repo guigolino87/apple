@@ -1233,5 +1233,28 @@ class StripHelperTests(unittest.TestCase):
             shutil.rmtree(root, ignore_errors=True)
 
 
+    def test_blocked_tls_counter_reads_both_port_renderings(self):
+        class Result:
+            def __init__(self, text):
+                self.returncode = 0
+                self.stdout = text
+                self.stderr = ''
+
+        sample = (
+            'Chain FORWARD (policy ACCEPT 0 packets, 0 bytes)\n'
+            'num   pkts bytes target     prot opt in     out     source    destination\n'
+            '1       17  1020 REJECT     tcp  --  wlan0  *       0.0.0.0/0  0.0.0.0/0   tcp dpt:443 reject-with icmp-port-unreachable\n'
+            '2        4   812 REJECT     udp  --  wlan0  *       0.0.0.0/0  0.0.0.0/0   udp dpt:https reject-with icmp-port-unreachable\n'
+            '3     9999  1.2M ACCEPT     all  --  wlan0  eth0    0.0.0.0/0  0.0.0.0/0\n')
+        original = self.mod.iptables
+        try:
+            self.mod.iptables = lambda args: Result(sample)
+            self.assertEqual(self.mod.blocked_tls_count(), 21)
+            self.mod.iptables = lambda args: Result('')
+            self.assertEqual(self.mod.blocked_tls_count(), 0)
+        finally:
+            self.mod.iptables = original
+
+
 if __name__ == '__main__':
     unittest.main()
