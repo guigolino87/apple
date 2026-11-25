@@ -62,7 +62,11 @@ SAVED_DIR = '/var/lib/pinapple/saved'
 SAVED_INDEX = '/var/lib/pinapple/saved.json'
 MAX_SAVED_ITEMS = 200
 HOSTAPD_CONF = '/etc/hostapd/hostapd.conf'
-EVILTWIN_BACKUP = '/etc/pinapple/hostapd-pre-eviltwin.conf'
+EVILTWIN_BACKUP = '/etc/pinapple/hostapd-pre-eviltwin.bak'
+# Older builds stored the AP backup as .conf inside conf-dir=/etc/pinapple,
+# which makes dnsmasq parse hostapd syntax and refuse to start. Migrated away.
+LEGACY_EVILTWIN_BACKUP = '/etc/pinapple/hostapd-pre-eviltwin.conf'
+DNSMASQ_HIJACK = '/etc/pinapple/dnsmasq-hijack.conf'
 FLAG_INTERNET = '/etc/pinapple/internet_enabled'
 FLAG_DNS = '/etc/pinapple/dns_hijack_enabled'
 FLAG_PORTAL = '/etc/pinapple/portal_redirect_enabled'
@@ -160,6 +164,24 @@ def service_status(name):
         return r.stdout.strip() == 'active'
     except Exception:
         return False
+
+
+def migrate_eviltwin_backup():
+    """Rename the legacy .conf backup so dnsmasq stops parsing hostapd syntax."""
+    try:
+        if os.path.exists(LEGACY_EVILTWIN_BACKUP):
+            if os.path.exists(EVILTWIN_BACKUP):
+                # Keep the newest real-AP backup, drop the stray .conf.
+                os.remove(LEGACY_EVILTWIN_BACKUP)
+            else:
+                os.replace(LEGACY_EVILTWIN_BACKUP, EVILTWIN_BACKUP)
+            audit('Renamed the Evil Twin AP backup to .bak (dnsmasq parsed it)',
+                  'warn')
+        os.makedirs(os.path.dirname(DNSMASQ_HIJACK), exist_ok=True)
+        if not os.path.exists(DNSMASQ_HIJACK):
+            open(DNSMASQ_HIJACK, 'a').close()
+    except OSError:
+        pass
 
 
 def system_info():
@@ -4312,6 +4334,18 @@ def _evil_twin_run(ssid, bssid, channel, ssid_trimmed, psk=''):
     except Exception as exc:
         _evil_twin_fail('could not start the cloned AP: %s' % exc)
         return
+    # An AP without DHCP looks "joinable" but every client fails at the IP
+    # step, which is exactly how a twin shows "failed to join".
+    dhcp_ok = False
+    for _ in range(12):
+        if service_status('pinapple-dhcp'):
+            dhcp_ok = True
+            break
+        time.sleep(0.5)
+    if not dhcp_ok:
+        _evil_twin_fail('the twin AP is up but DHCP (pinapple-dhcp) is not running, '
+                        'so clients cannot obtain an address')
+        return
     _twin_ap_since[0] = time.time()
     _twin_seen_client[0] = False
 
@@ -6005,6 +6039,7 @@ if __name__ == '__main__':
             pass
     ensure_config()
     restore_network_flags()
+    migrate_eviltwin_backup()
     reconcile_eviltwin_state()
     cleanup_orphan_handshakes()
     cleanup_orphan_beacon()

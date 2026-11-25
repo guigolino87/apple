@@ -63,6 +63,18 @@ if [[ -f portal/nginx-pinapple.conf ]]; then
     fi
 fi
 
+if [[ -f services/dnsmasq-pinapple.conf ]]; then
+    echo "==> Installing dnsmasq config"
+    install -m 0644 services/dnsmasq-pinapple.conf /etc/dnsmasq.d/pinapple.conf
+    mkdir -p /etc/pinapple
+    touch /etc/pinapple/dnsmasq-hijack.conf
+    systemctl reset-failed pinapple-dhcp 2>/dev/null || true
+    systemctl restart pinapple-dhcp || true
+    systemctl is-active --quiet pinapple-dhcp \
+        && echo "OK: dnsmasq active" \
+        || echo "WARNING: dnsmasq did not start; check journalctl -u pinapple-dhcp" >&2
+fi
+
 echo "==> Restarting dashboard"
 systemctl restart pinapple-dashboard
 
