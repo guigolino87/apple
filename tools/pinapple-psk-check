@@ -69,7 +69,7 @@ def read_log():
 
 
 def wpa_state(iface):
-    rc, out, _ = run(['wpa_cli', '-i', iface, 'status'], timeout=4)
+    rc, out, _ = run(['wpa_cli', '-p', CTRL_DIR, '-i', iface, 'status'], timeout=4)
     if rc != 0:
         return ''
     for line in out.splitlines():
@@ -79,15 +79,20 @@ def wpa_state(iface):
 
 
 def stop_supplicant(iface):
-    if shutil.which('wpa_cli'):
-        run(['wpa_cli', '-i', iface, 'terminate'], timeout=4)
+    # Kill every instance this helper started, whatever its pid file says.
+    run(['pkill', '-f', 'wpa_supplicant -i %s -c %s' % (iface, CONF_FILE)], timeout=4)
     try:
         with open(PID_FILE) as handle:
             pid = int(handle.read().strip())
         os.kill(pid, signal.SIGTERM)
     except (OSError, ValueError):
         pass
-    time.sleep(0.3)
+    time.sleep(0.4)
+    # A leftover control socket makes every later run fail to start.
+    try:
+        os.remove(os.path.join(CTRL_DIR, iface))
+    except OSError:
+        pass
 
 
 def main():
@@ -129,6 +134,10 @@ def main():
 
         try:
             os.makedirs(CTRL_DIR, exist_ok=True)
+        except OSError:
+            pass
+        try:
+            os.remove(os.path.join(CTRL_DIR, iface))
         except OSError:
             pass
         with open(CONF_FILE, 'w') as handle:
