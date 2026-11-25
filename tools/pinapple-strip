@@ -543,6 +543,11 @@ class ProxyHandler(socketserver.BaseRequestHandler):
         except Exception as exc:      # keep the proxy alive, log the failure
             state.bump('errors')
             try:
+                self._record(state, self.client_address[0], '-', '-', [],
+                             status=502, error=str(exc), note='proxy error')
+            except Exception:
+                pass
+            try:
                 self._send_error(sock, 502, 'proxy error: %s' % exc)
             except OSError:
                 pass
@@ -830,7 +835,8 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             pass
 
     def _record(self, state, client, method, url, headers, body=b'', status='',
-                upstream='http', note='', cookie='', auth='', ctype='', fields=None):
+                upstream='http', note='', cookie='', auth='', ctype='', fields=None,
+                error=''):
         if fields is None and body:
             fields = parse_form(body, ctype or header_first(headers, 'content-type'))
         record = {
@@ -842,6 +848,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             'status': status,
             'upstream': upstream,
             'note': note,
+            'error': truncate(error, 300),
             'ctype': truncate(ctype or header_first(headers, 'content-type'), 120),
             'fields': fields or {},
             'user_agent': truncate(header_first(headers, 'user-agent'), 200),

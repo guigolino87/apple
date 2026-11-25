@@ -1138,5 +1138,41 @@ class StripHelperTests(unittest.TestCase):
         self.assertEqual(inserted[inserted.index('-I') + 1:][:2], ['FORWARD', '1'])
 
 
+    def test_failed_request_is_logged_with_error(self):
+        import shutil
+        root = tempfile.mkdtemp(prefix='pinapple-strip-fail-')
+        names = ('LOG_DIR', 'LOG_FILE', 'JSONL_FILE')
+        old = {name: getattr(self.mod, name) for name in names}
+        try:
+            self.mod.LOG_DIR = root
+            self.mod.LOG_FILE = os.path.join(root, 'strip.log')
+            self.mod.JSONL_FILE = os.path.join(root, 'strip.jsonl')
+            handler = object.__new__(self.mod.ProxyHandler)
+            state = self.mod.ProxyState(10000, 'block')
+
+            class Sink:
+                def __init__(self):
+                    self.data = b''
+
+                def sendall(self, chunk):
+                    self.data += chunk
+
+            sink = Sink()
+            handler._fail(state, sink, '10.0.0.5', 'GET', 'http://nope.test/', [],
+                          error='DNS lookup failed')
+            self.assertTrue(sink.data.startswith(b'HTTP/1.1 502'), sink.data[:40])
+            records = self.mod.read_records(5)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]['status'], 502)
+            self.assertEqual(records[0]['note'], 'failed')
+            self.assertEqual(records[0]['error'], 'DNS lookup failed')
+            with open(self.mod.LOG_FILE, encoding='utf-8') as handle:
+                self.assertIn('error: DNS lookup failed', handle.read())
+        finally:
+            for name, value in old.items():
+                setattr(self.mod, name, value)
+            shutil.rmtree(root, ignore_errors=True)
+
+
 if __name__ == '__main__':
     unittest.main()
