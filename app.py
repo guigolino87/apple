@@ -4209,6 +4209,12 @@ def validate_psk_with_ap(psk, timeout=18, ssid=None, bssid=None, channel=None):
                     'detail': 'pinapple-psk-check is not installed (re-run install.sh)'}
         proc = _evil_twin_job[0]
         paused = _twin_pause_deauth(proc)
+        # With no twin running the monitor service owns wlan1 and its channel
+        # hopping makes the interface unusable for an association; stop it for
+        # the duration of the check.
+        recon_paused = proc is None
+        if recon_paused:
+            pause_recon()
         try:
             r = subprocess.run(
                 [PSK_HELPER, '--ssid', ssid, '--bssid', bssid,
@@ -4233,8 +4239,10 @@ def validate_psk_with_ap(psk, timeout=18, ssid=None, bssid=None, channel=None):
         finally:
             if paused:
                 _twin_resume_deauth(proc)
+            if recon_paused:
+                resume_recon()
             try:
-                set_wlan1_channel(int(info.get('channel') or 6))
+                set_wlan1_channel(channel)
             except Exception:
                 pass
     finally:
