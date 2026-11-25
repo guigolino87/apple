@@ -371,14 +371,16 @@ def read_hostapd_conf():
         pass
     return cfg
 
-def write_hostapd_conf(ssid, channel, mode, txpower):
+def write_hostapd_conf(ssid, channel, mode, txpower, passphrase=None):
     # SSIDs come from a web form; strip control characters so a newline
     # cannot inject extra hostapd directives.
     ssid = ''.join(ch if ord(ch) >= 32 and ord(ch) != 127 else ' '
                    for ch in str(ssid or ''))[:32]
     pwd_line = ''
     if mode == 'wpa2':
-        pwd_line = '\nwpa=2\nwpa_passphrase=pinapple123\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP'
+        key = ''.join(ch if ord(ch) >= 32 and ord(ch) != 127 else ' '
+                      for ch in str(passphrase or 'pinapple123'))[:63]
+        pwd_line = '\nwpa=2\nwpa_passphrase=%s\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP' % key
     conf = "interface=wlan0\ndriver=nl80211\nssid={}\nhw_mode=g\nchannel={}\nieee80211n=1\n".format(ssid, channel)
     conf += "ht_capab=[SHORT-GI-20][DSSS_CCK-40]\nwmm_enabled=1\nauth_algs=1\nignore_broadcast_ssid=0"
     conf += pwd_line + "\n"
@@ -3938,7 +3940,7 @@ def _evil_twin_fail(message):
     restore_wlan1_idle()
 
 
-def _evil_twin_run(ssid, bssid, channel, ssid_trimmed):
+def _evil_twin_run(ssid, bssid, channel, ssid_trimmed, psk=''):
     """Rebuild wlan0 into the twin AFTER the HTTP response was sent.
 
     Stopping pinapple-ap takes the AP - and therefore the dashboard - offline,
@@ -3979,7 +3981,7 @@ def _evil_twin_run(ssid, bssid, channel, ssid_trimmed):
     except Exception:
         warnings.append('could not reconfigure wlan0')
     try:
-        write_hostapd_conf(ssid, channel, 'open', None)
+        write_hostapd_conf(ssid, channel, 'wpa2' if psk else 'open', None, psk or None)
     except OSError as exc:
         _evil_twin_fail('could not write the cloned AP config: %s' % exc)
         return
@@ -4012,6 +4014,7 @@ def _evil_twin_run(ssid, bssid, channel, ssid_trimmed):
     _evil_twin_info[0] = {
         'ssid': ssid, 'bssid': bssid, 'channel': channel,
         'original_mac': original_mac,
+        'security': 'WPA2' if psk else 'open',
         'started': datetime.datetime.now().isoformat(timespec='seconds'),
     }
     try:
@@ -4025,11 +4028,11 @@ def _evil_twin_run(ssid, bssid, channel, ssid_trimmed):
              ('; warnings: ' + '; '.join(warnings)) if warnings else ''))
 
 
-def _evil_twin_worker(ssid, bssid, channel, ssid_trimmed):
+def _evil_twin_worker(ssid, bssid, channel, ssid_trimmed, psk=''):
     """Wrap the twin build so a crash always ends the 'starting' window."""
     _evil_twin_starting[0] = True
     try:
-        _evil_twin_run(ssid, bssid, channel, ssid_trimmed)
+        _evil_twin_run(ssid, bssid, channel, ssid_trimmed, psk)
     except Exception as exc:
         audit('Evil Twin crashed: %s' % exc, 'error')
         try:
@@ -4058,6 +4061,11 @@ def api_evil_twin_start():
     if error:
         return jsonify({'ok': False, 'error': error})
     channel = channel or 6
+    psk = str(data.get('psk', '') or '').strip()
+    if psk and not (8 <= len(psk.encode('utf-8', 'ignore')) <= 63):
+        return jsonify({'ok': False,
+                        'error': 'the WPA2 passphrase must be 8-63 characters (leave it '
+                                 'empty to clone the network as open)'})
     if not os.path.exists(DEAUTH_HELPER):
         return jsonify({'ok': False, 'error': 'deauth helper is not installed'}), 500
     if ap_backend() != 'hostapd':
@@ -4084,14 +4092,15 @@ def api_evil_twin_start():
     _evil_twin_info[0] = None
 
     _evil_twin_info[0] = {'ssid': ssid, 'bssid': bssid, 'channel': channel,
-                          'started': ''}
+                          'security': 'WPA2' if psk else 'open', 'started': ''}
     _evil_twin_error[0] = None
     threading.Thread(target=_evil_twin_worker,
-                     args=(ssid, bssid, channel, ssid_trimmed),
+                     args=(ssid, bssid, channel, ssid_trimmed, psk),
                      daemon=True).start()
-    audit('Evil Twin requested: %s (%s) channel %s' % (ssid, bssid, channel))
+    audit('Evil Twin requested: %s (%s) channel %s %s'
+          % (ssid, bssid, channel, 'WPA2' if psk else 'open'))
     return jsonify({'ok': True, 'starting': True, 'ssid': ssid, 'bssid': bssid,
-                    'channel': channel,
+                    'channel': channel, 'security': 'WPA2' if psk else 'open',
                     'note': 'wlan0 is being rebuilt as the twin. Reconnect to "%s" '
                             'and reopen http://10.0.0.1:8080' % ssid})
 
@@ -4103,7 +4112,8 @@ def api_evil_twin_status():
         info = _evil_twin_info[0] or {}
         return jsonify({'ok': True, 'running': False, 'starting': True,
                         'ssid': info.get('ssid', ''), 'bssid': info.get('bssid', ''),
-                        'channel': info.get('channel', ''), 'started': '',
+                        'channel': info.get('channel', ''),
+                        'security': info.get('security', ''), 'started': '',
                         'error': ''})
     proc = _evil_twin_job[0]
     running = bool(proc is not None and proc.poll() is None)
@@ -4130,6 +4140,7 @@ def api_evil_twin_status():
     return jsonify({'ok': True, 'running': running,
                     'ssid': info.get('ssid', ''), 'bssid': info.get('bssid', ''),
                     'channel': info.get('channel', ''), 'started': info.get('started', ''),
+                    'security': info.get('security', ''),
                     'error': ('' if running else (_evil_twin_error[0] or ''))})
 
 
@@ -4372,7 +4383,8 @@ def wlan1_page():
   <div class="sh"><span class="st">Evil Twin</span>
     <span style="color:var(--warn);font-size:0.75rem">&#9888; Authorized networks only</span></div>
   <p class="hint" style="margin:-8px 0 10px">Clones a target SSID/BSSID on wlan0 and deauths the real AP so clients reconnect to the twin. Requires the hostapd stack. The phone may briefly disconnect from the PiNAPPLE hotspot.</p>
-  <div class="warnbox">Starting the Evil Twin rebuilds wlan0, which serves this dashboard, so this page will lose the network for a few seconds — that is expected. When the twin is up, reconnect to the target SSID (the same name as the network you are cloning) and open <code>http://10.0.0.1:8080</code> again. The twin AP is open (no password).</div>
+  <div class="warnbox">Starting the Evil Twin rebuilds wlan0, which serves this dashboard, so this page will lose the network for a few seconds — that is expected. When the twin is up, reconnect to the target SSID and open <code>http://10.0.0.1:8080</code> again.<br><br>
+  <strong>iPhone/Android rule:</strong> a phone will not join an open clone of a network it has saved as WPA2. For a saved WPA2 target, enter the recovered passphrase (8–63 chars) so the clone matches what the phone expects. Leave it empty only for an SSID the device does not have saved (or after "Forget This Network").</div>
   <div class="status-card" role="status" aria-live="polite" id="et-status-card">
     <span class="dot"></span>
     <div class="sc-copy"><strong id="et-state">Idle</strong><span id="et-sub">No twin running</span></div>
@@ -4400,6 +4412,10 @@ def wlan1_page():
       <div class="fg">
         <label>Channel</label>
         <input id="et-channel" type="number" value="6" min="1" max="14" inputmode="numeric">
+      </div>
+      <div class="fg">
+        <label>WPA2 passphrase (optional)</label>
+        <input id="et-psk" placeholder="Empty = open twin" autocomplete="off">
       </div>
     </div>
     <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
@@ -4986,10 +5002,12 @@ async function refreshEvilTwinStatus(){
   if(stop) stop.disabled = !(running || starting);
   if(starting){
     setStatusCard('et-status-card','et-state','et-sub','et-meta','busy','Twin starting',
-      'Rebuilding wlan0 as ' + (r.ssid || 'the target') + ' on channel ' + (r.channel || '?'), '');
+      'Rebuilding wlan0 as ' + (r.ssid || 'the target') + ' on channel ' + (r.channel || '?') +
+      (r.security ? ' (' + r.security + ')' : ''), '');
   } else if(running){
     setStatusCard('et-status-card','et-state','et-sub','et-meta','on','Evil Twin active',
-      'Cloning ' + (r.ssid || '?') + ' on channel ' + (r.channel || '?'), '');
+      'Cloning ' + (r.ssid || '?') + ' on channel ' + (r.channel || '?') +
+      (r.security ? ' (' + r.security + ')' : ''), '');
     const ssidEl=document.getElementById('et-ssid');
     const bssidEl=document.getElementById('et-bssid');
     const chEl=document.getElementById('et-channel');
@@ -5010,12 +5028,14 @@ async function startEvilTwin(){
   const ssid = document.getElementById('et-ssid').value.trim();
   const bssid = document.getElementById('et-bssid').value.trim();
   const channel = document.getElementById('et-channel').value;
+  const psk = (document.getElementById('et-psk').value || '').trim();
   if(!ssid || !bssid){ toast('Enter both the target SSID and BSSID.', 'warn'); return; }
+  if(psk && (psk.length < 8 || psk.length > 63)){ toast('The WPA2 passphrase must be 8-63 characters.', 'warn'); return; }
   if(!confirm('Start Evil Twin for "' + ssid + '"?\n\nThis reconfigures wlan0 and may disconnect this phone from the PiNAPPLE hotspot.')) return;
 
   const btn = document.getElementById('et-start');
   busy(btn, true, 'Starting\u2026');
-  const r = await api('/api/wlan1/evil-twin/start', 'POST', {ssid:ssid, bssid:bssid, channel:channel});
+  const r = await api('/api/wlan1/evil-twin/start', 'POST', {ssid:ssid, bssid:bssid, channel:channel, psk:psk});
   busy(btn, false);
   if(r && r.ok){
     toast('Evil Twin starting on "'+ssid+'". Reconnect to that SSID, then open http://10.0.0.1:8080.', 'warn', 15000);

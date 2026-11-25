@@ -118,6 +118,8 @@ Only one feature can own `wlan1` at a time: starting a beacon flood stops deauth
 
 **Deauth** validates MAC addresses, resolves the target channel from the last recon scan (or accepts an explicit channel), and exposes a rate control. Continuous deauth jobs are tracked, stopped by process group, and cleaned up through a PID file if the dashboard restarts; the WLAN1 mode badge and Evil Twin stop button are wired up again.
 
+**Evil Twin** rebuilds `wlan0` into a clone of the target (SSID, BSSID, channel) and deauths the real AP from `wlan1` so clients look for the twin. The rebuild runs in a worker thread after the HTTP response, because stopping `pinapple-ap` also takes down the AP that serves the dashboard. A phone will only auto-join a clone whose security matches what it saved: cloning a WPA2 network as open makes iOS/Android prompt for the old password and fail ("unable to connect"). Supply the recovered passphrase in the optional field to build a WPA2 twin that matches the saved profile, or target an SSID the device does not have saved (or forget the network first) for an open twin.
+
 All helpers are installed to `/usr/local/bin/` by `install.sh` and use only the Python standard library.
 
 ### Mobile dashboard
