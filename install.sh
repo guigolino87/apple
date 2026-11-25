@@ -34,7 +34,7 @@ apt-get update
 # 4. apt-get install system dependencies
 apt-get install -y hostapd dnsmasq aircrack-ng hcxdumptool hcxtools \
     macchanger iw wireless-tools net-tools rfkill usbutils nginx iptables ieee-data \
-    logrotate python3 python3-pip python3-venv network-manager
+    logrotate python3 python3-pip python3-venv network-manager tcpdump
 
 # mdk4 is packaged separately from aircrack-ng and is not present on every
 # image. Fall back to a source build so beacon flooding works out of the box.
@@ -121,7 +121,7 @@ cat > /etc/logrotate.d/pinapple <<'EOF'
 EOF
 
 # 12b. Verify the wireless tooling the beacon/deauth/handshake helpers rely on
-for tool in mdk4 iw airodump-ng aireplay-ng hcxdumptool hcxpcapngtool nmcli; do
+for tool in mdk4 iw airodump-ng aireplay-ng hcxdumptool hcxpcapngtool nmcli tcpdump; do
     if command -v "$tool" >/dev/null 2>&1; then
         echo "OK: $tool found at $(command -v "$tool")"
     else

