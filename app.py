@@ -34,6 +34,7 @@ _pmkid_started = [None]
 _evil_twin_job = [None]
 _evil_twin_info = [None]
 _evil_twin_starting = [False]
+_evil_twin_error = [None]
 _wlan1_owner = [None]
 _wlan1_claimed_at = [0.0]
 _wlan1_lock = threading.Lock()
@@ -1394,6 +1395,11 @@ def wlan1_owner_alive(owner):
         return bool(state.get('pid') and pid_alive(state.get('pid'), 'hcxdumptool'))
     if owner == 'eviltwin':
         if _evil_twin_starting[0]:
+            return True
+        # A twin that is up is useful even if its deauth helper died: tearing
+        # the cloned AP down would also kick the operator. Give it a grace
+        # window before the watchdog decides the tool is dead.
+        if time.time() - (_wlan1_claimed_at[0] or 0) < 90:
             return True
         proc = _evil_twin_job[0]
         if proc is not None and proc.poll() is None:
@@ -3923,6 +3929,15 @@ def api_pmkid_stop():
 
 
 # Evil Twin Routes
+def _evil_twin_fail(message):
+    """Record a twin start failure, restore the real AP and free the radio."""
+    _evil_twin_error[0] = message
+    audit('Evil Twin failed: %s' % message, 'error')
+    restore_ap_after_eviltwin(message)
+    release_wlan1('eviltwin')
+    restore_wlan1_idle()
+
+
 def _evil_twin_run(ssid, bssid, channel, ssid_trimmed):
     """Rebuild wlan0 into the twin AFTER the HTTP response was sent.
 
@@ -3952,10 +3967,7 @@ def _evil_twin_run(ssid, bssid, channel, ssid_trimmed):
     except Exception:
         warnings.append('could not stop the normal AP')
     if service_status('pinapple-ap'):
-        restore_ap_after_eviltwin('could not stop the normal AP')
-        release_wlan1('eviltwin')
-        restore_wlan1_idle()
-        audit('Evil Twin failed: could not stop the normal AP', 'error')
+        _evil_twin_fail('could not stop the normal AP; is hostapd busy?')
         return
     try:
         subprocess.run(['ip', 'link', 'set', 'wlan0', 'down'], capture_output=True, timeout=5)
@@ -3969,29 +3981,20 @@ def _evil_twin_run(ssid, bssid, channel, ssid_trimmed):
     try:
         write_hostapd_conf(ssid, channel, 'open', None)
     except OSError as exc:
-        restore_ap_after_eviltwin('evil twin config failed')
-        release_wlan1('eviltwin')
-        restore_wlan1_idle()
-        audit('Evil Twin failed: could not write the cloned AP config: %s' % exc, 'error')
+        _evil_twin_fail('could not write the cloned AP config: %s' % exc)
         return
     try:
         r = subprocess.run(['systemctl', 'start', 'pinapple-ap'],
                            capture_output=True, text=True, timeout=10)
         if r.returncode != 0:
             detail = (r.stderr or r.stdout).strip().splitlines()
-            restore_ap_after_eviltwin('clone AP failed to start')
-            release_wlan1('eviltwin')
-            restore_wlan1_idle()
-            audit('Evil Twin failed: the cloned AP did not start: %s'
-                  % (detail[-1] if detail else 'hostapd error'), 'error')
+            _evil_twin_fail('the cloned AP did not start: %s'
+                            % (detail[-1] if detail else 'hostapd error'))
             return
         subprocess.run(['systemctl', 'restart', 'pinapple-dhcp'],
                        capture_output=True, timeout=15)
     except Exception as exc:
-        restore_ap_after_eviltwin('clone AP failed to start')
-        release_wlan1('eviltwin')
-        restore_wlan1_idle()
-        audit('Evil Twin failed: could not start the cloned AP: %s' % exc, 'error')
+        _evil_twin_fail('could not start the cloned AP: %s' % exc)
         return
 
     try:
@@ -4000,10 +4003,7 @@ def _evil_twin_run(ssid, bssid, channel, ssid_trimmed):
             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
             start_new_session=True)
     except OSError as exc:
-        restore_ap_after_eviltwin('deauth helper failed to start')
-        release_wlan1('eviltwin')
-        restore_wlan1_idle()
-        audit('Evil Twin failed: could not start the deauth helper: %s' % exc, 'error')
+        _evil_twin_fail('could not start the deauth helper: %s' % exc)
         return
     _evil_twin_job[0] = proc
     time.sleep(0.25)
@@ -4039,6 +4039,8 @@ def _evil_twin_worker(ssid, bssid, channel, ssid_trimmed):
         release_wlan1('eviltwin')
         restore_wlan1_idle()
     finally:
+        if _evil_twin_job[0] is None and _evil_twin_error[0] is None:
+            _evil_twin_error[0] = 'the twin did not start; check the Activity log'
         _evil_twin_starting[0] = False
 
 
@@ -4083,6 +4085,7 @@ def api_evil_twin_start():
 
     _evil_twin_info[0] = {'ssid': ssid, 'bssid': bssid, 'channel': channel,
                           'started': ''}
+    _evil_twin_error[0] = None
     threading.Thread(target=_evil_twin_worker,
                      args=(ssid, bssid, channel, ssid_trimmed),
                      daemon=True).start()
@@ -4100,7 +4103,8 @@ def api_evil_twin_status():
         info = _evil_twin_info[0] or {}
         return jsonify({'ok': True, 'running': False, 'starting': True,
                         'ssid': info.get('ssid', ''), 'bssid': info.get('bssid', ''),
-                        'channel': info.get('channel', ''), 'started': ''})
+                        'channel': info.get('channel', ''), 'started': '',
+                        'error': ''})
     proc = _evil_twin_job[0]
     running = bool(proc is not None and proc.poll() is None)
     info = _evil_twin_info[0] or {}
@@ -4125,7 +4129,8 @@ def api_evil_twin_status():
         release_wlan1_and_restore('eviltwin')
     return jsonify({'ok': True, 'running': running,
                     'ssid': info.get('ssid', ''), 'bssid': info.get('bssid', ''),
-                    'channel': info.get('channel', ''), 'started': info.get('started', '')})
+                    'channel': info.get('channel', ''), 'started': info.get('started', ''),
+                    'error': ('' if running else (_evil_twin_error[0] or ''))})
 
 
 @app.route('/api/wlan1/evil-twin/stop', methods=['POST'])
@@ -4994,7 +4999,8 @@ async function refreshEvilTwinStatus(){
     const out = document.getElementById('et-output');
     if(out){ out.style.display = 'block'; out.textContent = 'Cloning ' + (r.ssid || '?') + ' (' + (r.bssid || '?') + ') ch ' + (r.channel || '?'); }
   } else {
-    setStatusCard('et-status-card','et-state','et-sub','et-meta','', 'Idle', 'No twin running', '');
+    setStatusCard('et-status-card','et-state','et-sub','et-meta', r.error ? 'err' : '', 'Idle',
+      r.error || 'No twin running', '');
   }
   if((running || starting) && !etPoll) etPoll = setInterval(function(){ if(wlActiveTab === 'eviltwin') refreshEvilTwinStatus(); }, 3000);
   if(!running && !starting && etPoll){ clearInterval(etPoll); etPoll = null; }
