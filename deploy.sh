@@ -74,6 +74,11 @@ if [[ -f services/dnsmasq-pinapple.conf ]]; then
     install -m 0644 services/dnsmasq-pinapple.conf /etc/dnsmasq.d/pinapple.conf
     mkdir -p /etc/pinapple
     touch /etc/pinapple/dnsmasq-hijack.conf
+    # dnsmasq also listens on 127.0.0.1, so the DNS hijack would hijack the
+    # Pi's own lookups (breaking git/apt). Keep an upstream resolver first.
+    if [[ ! -f /etc/resolv.conf.head ]]; then
+        printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf.head
+    fi
     systemctl reset-failed pinapple-dhcp 2>/dev/null || true
     systemctl restart pinapple-dhcp || true
     systemctl is-active --quiet pinapple-dhcp \
