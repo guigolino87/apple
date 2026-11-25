@@ -651,6 +651,14 @@ def ssid_for_bssid(bssid):
 
 
 def resolve_channel(requested, bssid):
+    """Pick the channel for a twin.
+
+    The clone and the deauth must sit on the target's real channel: a twin on
+    another channel is invisible to clients locked to the real AP, and deauth
+    frames sent elsewhere never arrive. So a scanned channel always wins over
+    a hand-typed one.
+    """
+    scanned = channel_for_bssid(bssid)
     if requested not in (None, '', 0, '0'):
         try:
             channel = int(requested)
@@ -658,8 +666,10 @@ def resolve_channel(requested, bssid):
             return None, 'channel must be a number'
         if not 1 <= channel <= 14:
             return None, 'channel must be between 1 and 14'
+        if scanned and scanned != channel:
+            return scanned, None
         return channel, None
-    return channel_for_bssid(bssid), None
+    return scanned, None
 
 
 def set_wlan1_channel(channel):
@@ -4169,6 +4179,22 @@ def _twin_clients():
     return sum(1 for line in r.stdout.splitlines() if line.startswith('Station'))
 
 
+def _iface_channel(name):
+    try:
+        r = subprocess.run(['iw', 'dev', name, 'info'],
+                           capture_output=True, text=True, timeout=4)
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith('channel '):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return 0
+    return 0
+
+
 def _twin_status_payload():
     info = _evil_twin_info[0] or read_json_file(EVILTWIN_STATE, {})
     clients = _twin_clients() if (_evil_twin_job[0] is not None or _twin_ap_since[0]) else 0
@@ -4180,6 +4206,7 @@ def _twin_status_payload():
         'channel': info.get('channel', ''),
         'clients': clients,
         'deauth': bool(_evil_twin_job[0] is not None and _evil_twin_job[0].poll() is None),
+        'deauth_channel': _iface_channel('wlan1'),
         'ap_seconds': int(time.time() - _twin_ap_since[0]) if _twin_ap_since[0] else 0,
         'idle_revert': TWIN_IDLE_REVERT_SECONDS,
     }
@@ -4411,6 +4438,12 @@ def api_evil_twin_start():
     if error:
         return jsonify({'ok': False, 'error': error})
     channel = channel or 6
+    scan_channel = channel_for_bssid(bssid)
+    channel_notes = []
+    if scan_channel and str(data.get('channel')) not in ('', 'None') \
+            and str(scan_channel) != str(data.get('channel')):
+        channel_notes.append('using the real target channel %d instead of %s'
+                             % (scan_channel, data.get('channel')))
     psk = str(data.get('psk', '') or '').strip()
     if psk and not (8 <= len(psk.encode('utf-8', 'ignore')) <= 63):
         return jsonify({'ok': False,
@@ -4452,6 +4485,7 @@ def api_evil_twin_start():
           % (ssid, bssid, channel, 'WPA2' if psk else 'open'))
     return jsonify({'ok': True, 'starting': True, 'ssid': ssid, 'bssid': bssid,
                     'channel': channel, 'security': 'WPA2' if psk else 'open',
+                    'warnings': channel_notes,
                     'note': 'wlan0 is being rebuilt as the twin. Reconnect to "%s" '
                             'and reopen http://10.0.0.1:8080' % ssid})
 
@@ -5470,6 +5504,7 @@ async function refreshEvilTwinStatus(){
       'Cloning ' + (r.ssid || '?') + ' on channel ' + (r.channel || '?') +
       (r.security ? ' (' + r.security + ')' : '') +
       ' · ' + (t.clients || 0) + ' client(s) · hostapd ' + (t.hostapd ? 'up' : 'DOWN') +
+      (t.deauth_channel ? ' · deauth ch' + t.deauth_channel : '') +
       ((t.clients || 0) === 0 && t.ap_seconds
         ? ' · reverts in ' + Math.max(0, (t.idle_revert || 120) - t.ap_seconds) + 's if nobody joins'
         : ''), '');
