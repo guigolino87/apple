@@ -166,7 +166,7 @@ The WPA2 handshake helper is now part of the repository (`tools/pinapple-handsha
 
 ### AP, DHCP, and monitor stack
 
-New installs use hostapd + dnsmasq on `wlan0` at `10.0.0.1`, with NetworkManager leaving both `wlan0` and `wlan1` unmanaged. `pinapple-ap`, `pinapple-dhcp`, and `pinapple-portal` are installed and enabled. The `pinapple-monitor` service owns `wlan1` in monitor mode and writes `probes.json`, `clients_seen.json`, `scan.json`, and `monitor_status.json`; it is paused automatically while an attack owns the radio and resumed afterwards. Rescan temporarily hands `wlan1` to NetworkManager for `nmcli`, then returns it; if NetworkManager is unavailable it falls back to a direct `iw` scan.
+New installs use hostapd + dnsmasq on `wlan0` at `10.0.0.1`, with NetworkManager leaving both `wlan0` and `wlan1` unmanaged. `pinapple-ap`, `pinapple-dhcp`, and `pinapple-portal` are installed and enabled. The `pinapple-monitor` service owns `wlan1` in monitor mode and writes `probes.json`, `clients_seen.json`, `scan.json`, and `monitor_status.json`; it is paused automatically while an attack owns the radio and resumed afterwards. Rescan never reconfigures the radio: it waits for the monitor to finish a channel pass and reads `scan.json`. `wlan1` is never handed to NetworkManager and its mode is never flipped by a scan, because taking the attack adapter down also drops clients from the `wlan0` dashboard AP. Only an explicit mode switch in `wlan1` settings, or an attack claiming the radio, changes the interface.
 
 ### Custom captive portal templates
 

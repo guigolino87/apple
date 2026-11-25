@@ -22,8 +22,9 @@
   on `10.0.0.1`. Managed by `pinapple-ap` + `pinapple-dhcp`; do not use
   NetworkManager for this interface.
 - `wlan1` (USB, TL-WN722N v1): used by the monitor and WLAN1 tools. NetworkManager
-  leaves it unmanaged; the dashboard's Rescan temporarily hands it back for
-  `nmcli` scanning, then returns it to the monitor.
+  leaves it unmanaged and the dashboard never hands it over. Rescan is passive:
+  it waits for the monitor's next channel pass and reads `scan.json`, so the
+  attack adapter is never taken down while the AP is serving clients.
 
 ## Verifying the install
 1. Run `pinapple-status`. All services should be `active`, wlan0 should have

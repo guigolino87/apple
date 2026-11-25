@@ -43,6 +43,7 @@ WLAN1_OWNER_NAMES = {'beacon': 'Beacon Flood', 'deauth': 'Deauth', 'pmkid': 'PMK
                      'eviltwin': 'Evil Twin', 'handshake': 'Handshake'}
 _saved_lock = threading.Lock()
 _audit_lock = threading.Lock()
+_scan_lock = threading.Lock()
 
 CONFIG_FILE = '/etc/pinapple/config.json'
 CREDS_LOG = '/var/log/pinapple/creds.log'
@@ -150,6 +151,38 @@ def service_status(name):
         return r.stdout.strip() == 'active'
     except Exception:
         return False
+
+
+def write_json_atomic(path, value):
+    """Write JSON through a temp file so readers never see it half-written.
+
+    scan.json is shared with the wlan1 monitor: a plain open('w') truncates
+    the file, and /api/recon can then read an empty document and blank the
+    Recon table while the scan is running.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = '%s.tmp.%d' % (path, os.getpid())
+    with open(tmp, 'w') as handle:
+        json.dump(value, handle, indent=2)
+    os.replace(tmp, path)
+
+
+def wait_for_monitor_refresh(timeout=6.0, settle=1.0):
+    """Give the passive monitor time to complete a channel pass.
+
+    The monitor already sweeps every channel and rewrites scan.json every
+    couple of seconds, so "scan" is a read, never a radio reconfiguration.
+    """
+    started = time.time()
+    while time.time() - started < timeout:
+        time.sleep(0.25)
+        try:
+            if (os.path.getmtime(SCAN_JSON) >= started and
+                    time.time() - started >= settle):
+                return True
+        except OSError:
+            pass
+    return False
 
 
 def restore_network_flags():
@@ -2144,95 +2177,77 @@ def api_recon():
 @app.route('/api/recon/scan', methods=['POST'])
 @require_auth
 def api_recon_scan():
-    reconcile_wlan1_owner()
-    if _wlan1_owner[0]:
-        label = WLAN1_OWNER_NAMES.get(_wlan1_owner[0], _wlan1_owner[0])
-        return jsonify({'ok': False,
-                        'error': f'wlan1 is busy with {label}. Stop it before scanning.'})
+    """Refresh the recon list without reconfiguring the radios.
 
-    paused = False
-    notes = []
+    The dedicated attack adapter (wlan1, TL-WN722N/AR9271) is already swept
+    continuously by pinapple-monitor, which writes scan.json. "Scan" therefore
+    only asks the monitor for a fresh pass. Taking wlan1 down, flipping it to
+    managed mode or handing it to NetworkManager kicks clients off the AP
+    (wlan0) and breaks the dashboard connection - never do that here.
+    """
+    if not _scan_lock.acquire(blocking=False):
+        return jsonify({'ok': False, 'error': 'a scan is already running'})
+
     try:
-        # Pause whichever recon/scan service is actually active, then bring
-        # exactly that service back when the managed-mode scan is done.
-        paused = pause_recon()
-
-        mode_ok, mode_msg = set_wlan1_mode('managed')
-        if not mode_ok:
+        owner = reconcile_wlan1_owner()
+        if owner:
+            label = WLAN1_OWNER_NAMES.get(owner, owner)
             return jsonify({'ok': False,
-                            'error': 'could not switch wlan1 to managed mode: ' + mode_msg})
+                            'error': f'wlan1 is busy with {label}. Stop it before scanning.'})
 
-        networks = []
-        source = ''
-        if shutil.which('nmcli'):
-            try:
-                managed = subprocess.run(
-                    ['nmcli', 'dev', 'set', 'wlan1', 'managed', 'yes'],
-                    capture_output=True, text=True, timeout=10)
-                if managed.returncode != 0:
-                    detail = (managed.stderr or managed.stdout).strip().splitlines()
-                    notes.append('NetworkManager: %s' %
-                                 (detail[-1] if detail else 'could not manage wlan1'))
-                else:
-                    subprocess.run(['nmcli', 'dev', 'wifi', 'rescan'],
-                                   capture_output=True, timeout=10)
-                    time.sleep(2)
-                    r = subprocess.run(
-                        ['nmcli', '-t', '-f', 'SSID,BSSID,CHAN,SIGNAL,SECURITY',
-                         'dev', 'wifi', 'list'],
-                        capture_output=True, text=True, timeout=20)
-                    if r.returncode != 0:
-                        detail = (r.stderr or r.stdout).strip().splitlines()
-                        notes.append('nmcli: %s' %
-                                     (detail[-1] if detail else 'scan failed'))
-                    else:
-                        networks = parse_nmcli_wifi(r.stdout)
-                        source = 'nmcli'
-            except (OSError, subprocess.SubprocessError) as exc:
-                notes.append('nmcli: %s' % exc)
-        else:
-            notes.append('NetworkManager (nmcli) is not installed')
+        mode = get_wlan1_mode()
+        if mode == 'AP':
+            return jsonify({'ok': False,
+                            'error': 'wlan1 is serving an access point; refusing to scan it'})
 
-        if not networks:
-            # Fallback for images without NetworkManager: scan directly with iw.
-            iw_networks, iw_error = scan_wlan1_with_iw()
-            if iw_networks:
-                networks = iw_networks
-                source = 'iw'
-            elif iw_error:
+        notes = []
+        audit('Recon scan requested (wlan1: %s)' % mode)
+
+        if recon_active():
+            # Passive refresh: one full channel pass, no interface changes.
+            wait_for_monitor_refresh()
+            networks = get_recon()
+            if networks:
+                audit('Recon scan complete: %d networks (monitor)' % len(networks))
+                return jsonify({'ok': True, 'count': len(networks), 'source': 'monitor'})
+            notes.append('the monitor has not reported any networks yet')
+        elif mode == 'managed':
+            # wlan1 is already an idle managed client: an iw scan changes nothing.
+            networks, iw_error = scan_wlan1_with_iw()
+            if networks:
+                write_json_atomic(SCAN_JSON, networks)
+                audit('Recon scan complete: %d networks (iw)' % len(networks))
+                return jsonify({'ok': True, 'count': len(networks), 'source': 'iw'})
+            if iw_error:
                 notes.append('iw: %s' % iw_error)
+        else:
+            # Monitor stopped: start the passive scanner instead of flipping
+            # the radio behind the user's back.
+            start_recon_now()
+            if recon_active():
+                wait_for_monitor_refresh(timeout=8.0)
+                networks = get_recon()
+                if networks:
+                    audit('Recon scan complete: %d networks (monitor restarted)'
+                          % len(networks))
+                    return jsonify({'ok': True, 'count': len(networks),
+                                    'source': 'monitor'})
+            notes.append('the wlan1 monitor is not running; start pinapple-monitor '
+                         '(or switch wlan1 back to monitor mode) and retry')
 
-        if not networks:
-            existing = get_recon()
-            detail = '; '.join(notes) if notes else 'no networks found'
-            if existing:
-                return jsonify({'ok': True, 'count': 0, 'kept': len(existing),
-                                'note': 'no new networks found; kept the previous scan',
-                                'details': detail})
-            return jsonify({'ok': False, 'error': detail})
-
-        os.makedirs(os.path.dirname(SCAN_JSON), exist_ok=True)
-        with open(SCAN_JSON, 'w') as f:
-            json.dump(networks, f, indent=2)
-        audit('Recon scan complete: %d networks (%s)' % (len(networks), source))
-        payload = {'ok': True, 'count': len(networks), 'source': source}
-        if notes:
-            payload['details'] = '; '.join(notes)
-        return jsonify(payload)
-    except subprocess.SubprocessError as exc:
-        return jsonify({'ok': False, 'error': 'scan command failed: %s' % exc})
+        existing = get_recon()
+        detail = '; '.join(notes) if notes else 'no networks found'
+        if existing:
+            return jsonify({'ok': True, 'count': 0, 'kept': len(existing),
+                            'note': 'no new networks found; kept the previous scan',
+                            'details': detail})
+        audit('Recon scan found no networks: %s' % detail, 'warn')
+        return jsonify({'ok': False, 'error': detail})
     except Exception as e:
+        audit('Recon scan failed: %s' % e, 'error')
         return jsonify({'ok': False, 'error': str(e)})
     finally:
-        try:
-            subprocess.run(['nmcli', 'dev', 'set', 'wlan1', 'managed', 'no'],
-                           capture_output=True, timeout=10)
-        except Exception:
-            pass
-        if paused and _recon_stopped[0]:
-            resume_recon()
-        else:
-            restore_wlan1_idle()
+        _scan_lock.release()
 
 
 @app.route('/creds')
