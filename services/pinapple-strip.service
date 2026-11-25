@@ -1,0 +1,20 @@
+[Unit]
+Description=PiNAPPLE HTTPS downgrade proxy (sslstrip)
+Documentation=https://github.com/Doge128/PiNAPPLE
+After=network.target pinapple-dhcp.service
+Wants=pinapple-dhcp.service
+
+[Service]
+Type=simple
+# The proxy alone is inert: `pinapple-strip on` adds the port-80 REDIRECT and
+# the 443 blocks. Restart=on-failure keeps the demo alive if the process dies.
+ExecStart=/usr/local/bin/pinapple-strip serve
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pinapple-strip
+
+[Install]
+WantedBy=multi-user.target

@@ -29,7 +29,9 @@ fi
 echo "==> Syntax check"
 "$PY" - <<'PY'
 files = ['app.py', 'extensions.py', 'ext_helpers.py', 'portal_handler.py',
-         'tools/pinapple-monitor']
+         'tools/pinapple-monitor', 'tools/pinapple-deauth',
+         'tools/pinapple-psk-check', 'tools/pinapple-psk-verify',
+         'tools/pinapple-strip']
 for name in files:
     with open(name, encoding='utf-8') as handle:
         compile(handle.read(), name, 'exec')
@@ -56,6 +58,10 @@ install -m 0755 tools/pinapple-* /usr/local/bin/
 
 echo "==> Installing dashboard unit"
 install -m 0644 pinapple-dashboard.service /etc/systemd/system/pinapple-dashboard.service
+if [[ -f services/pinapple-strip.service ]]; then
+    # Installed but not enabled: the downgrade must never survive a reboot.
+    install -m 0644 services/pinapple-strip.service /etc/systemd/system/pinapple-strip.service
+fi
 systemctl daemon-reload
 
 if [[ -f portal/nginx-pinapple.conf ]]; then

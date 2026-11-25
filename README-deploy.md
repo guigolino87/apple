@@ -55,3 +55,17 @@ reboots. Re-run it after every `git pull`.
 - `ip addr show wlan0`
 - `iw dev wlan1 info`
 - `sudo tail -n 100 /var/log/pinapple/events.log`
+
+## HTTPS downgrade (Intercept page)
+- `sudo pinapple-strip on` / `off` / `status` — port 80 redirect + 443 blocks.
+- Needs **Internet Passthrough ON**; it refuses to start with **DNS Hijack** or
+  **Portal Redirect** on, because all three claim port 80. The dashboard's
+  Intercept toggle turns those two off for you.
+- `pinapple-strip on --https allow` keeps 443 reachable: those flows stay
+  encrypted and do not appear in the log.
+- Captured requests: `sudo tail -f /var/log/pinapple/strip.log`
+  (machine-readable: `/var/log/pinapple/strip.jsonl`, both `0600`).
+- `pinapple-strip.service` is installed but deliberately **not enabled**; it must
+  be started from the dashboard or with `pinapple-strip on`.
+- Before a demo: set the AP to **Open**, use a device that has never visited the
+  test site, and turn off Chrome's *Always use secure connections*.

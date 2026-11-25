@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""Verify ONE typed WPA/WPA2 passphrase against a captured handshake.
+
+This is deliberately not a cracker. It answers a single question: "is the
+password the user just typed the passphrase of this capture?"  A single
+candidate costs one PBKDF2 run (~80 ms on a Pi 4), so the captive portal can
+validate a submission offline, without touching the radio.
+
+Input is the hashcat 22000 format that hcxpcapngtool already produces in this
+project:
+
+    WPA*01*PMKID*MAC_AP*MAC_STA*ESSID_HEX***
+    WPA*02*MIC*MAC_AP*MAC_STA*ESSID_HEX*NONCE_AP*EAPOL_HEX*MESSAGEPAIR
+
+References:
+  * 22000 layout: https://hashcat.net/wiki/doku.php?id=cracking_wpawpa2
+  * PMK:   IEEE 802.11-2020, 12.7.1.3 / RFC 2898 PBKDF2-HMAC-SHA1, 4096 rounds
+  * PMKID: HMAC-SHA1-128(PMK, "PMK Name" || AA || SPA)   (802.11 12.7.1.3)
+  * PTK:   PRF-512(PMK, "Pairwise key expansion", Min(AA,SPA)||Max(AA,SPA)||
+           Min(ANonce,SNonce)||Max(ANonce,SNonce))
+  * MIC:   HMAC-SHA1(KCK, EAPOL-Key) truncated to 16 bytes for CCMP,
+           HMAC-MD5 for TKIP (WPA1).
+
+Only message pairs whose EAPOL frame is the supplicant's M2 are supported
+(pair 0 = M1+M2, pair 2 = M2+M3); those carry the SNonce and the MIC, which is
+exactly what a twin/handshake capture produces. Anything else returns
+"unsupported" so the caller can fall back to a live association check.
+
+Standard library only.  Prints one JSON object.
+"""
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+MAX_FILE_BYTES = 8 * 1024 * 1024
+MAX_HASHES = 32
+MIC_OFFSET = 81
+MIC_LEN = 16
+NONCE_OFFSET = 17
+NONCE_LEN = 32
+
+
+def mac_from_hex(value):
+    try:
+        raw = bytes.fromhex(str(value or '').strip())
+    except ValueError:
+        return b''
+    return raw if len(raw) == 6 else b''
+
+
+def clean_hex(value):
+    value = str(value or '').strip().lower()
+    if not value or len(value) % 2:
+        return b''
+    try:
+        return bytes.fromhex(value)
+    except ValueError:
+        return b''
+
+
+def prf512(pmk, label, data):
+    """IEEE 802.11 PRF-512 with HMAC-SHA1 (the WPA2 KDF)."""
+    out = b''
+    counter = 0
+    while len(out) < 64:
+        out += hmac.new(pmk, label + b'\x00' + data + bytes([counter]),
+                        hashlib.sha1).digest()
+        counter += 1
+    return out[:64]
+
+
+def pmk_for(passphrase, essid, cache):
+    if essid not in cache:
+        cache[essid] = hashlib.pbkdf2_hmac('sha1', passphrase.encode('utf-8'),
+                                           essid, 4096, 32)
+    return cache[essid]
+
+
+def verify_pmkid(fields, passphrase, cache):
+    """WPA*01: PMKID = HMAC-SHA1-128(PMK, "PMK Name" || AP || STA)."""
+    pmkid = clean_hex(fields[2])
+    ap = mac_from_hex(fields[3])
+    sta = mac_from_hex(fields[4])
+    essid = clean_hex(fields[5])
+    if len(pmkid) != 16 or not ap or not sta or not essid:
+        return None, 'malformed WPA*01 line'
+    pmk = pmk_for(passphrase, essid, cache)
+    calc = hmac.new(pmk, b'PMK Name' + ap + sta, hashlib.sha1).digest()[:16]
+    return hmac.compare_digest(calc, pmkid), 'PMKID'
+
+
+def verify_eapol(fields, passphrase, cache):
+    """WPA*02: recompute the M2 MIC from the candidate PMK."""
+    mic = clean_hex(fields[2])
+    ap = mac_from_hex(fields[3])
+    sta = mac_from_hex(fields[4])
+    essid = clean_hex(fields[5])
+    anonce = clean_hex(fields[6])
+    eapol = clean_hex(fields[7])
+    try:
+        pair = int(str(fields[8] or '0'), 16) & 0x0F
+    except ValueError:
+        return None, 'malformed message-pair field'
+
+    if not mic or not ap or not sta or not essid:
+        return None, 'malformed WPA*02 line'
+    # M1+M2 (0) and M2+M3 (2) store the supplicant's M2, which has SNonce.
+    if pair not in (0, 2):
+        return None, 'message pair %d does not carry an M2 frame' % pair
+    if len(anonce) != 32:
+        return None, 'missing ANonce'
+    if len(eapol) < MIC_OFFSET + MIC_LEN:
+        return None, 'EAPOL frame too short'
+    if eapol[1] != 3:
+        return None, 'not an EAPOL-Key frame'
+    if len(eapol) < 4 + int.from_bytes(eapol[2:4], 'big'):
+        return None, 'truncated EAPOL frame'
+
+    snonce = eapol[NONCE_OFFSET:NONCE_OFFSET + NONCE_LEN]
+    if snonce == b'\x00' * NONCE_LEN:
+        return None, 'missing SNonce'
+
+    key_info = int.from_bytes(eapol[5:7], 'little')
+    mic_version = key_info & 0x07
+    if mic_version == 3:
+        return None, ('AES-CMAC MIC (WPA3/key descriptor 3) cannot be '
+                      'verified offline')
+
+    pmk = pmk_for(passphrase, essid, cache)
+    data = (min(ap, sta) + max(ap, sta) +
+            min(anonce, snonce) + max(anonce, snonce))
+    ptk = prf512(pmk, b'Pairwise key expansion', data)
+    kck = ptk[:16]
+
+    body = bytearray(eapol)
+    body[MIC_OFFSET:MIC_OFFSET + MIC_LEN] = b'\x00' * MIC_LEN
+    # hashcat's 22000 EAPOL kernel always uses HMAC-SHA1, even when a capture
+    # advertises key-descriptor version 1. Try MD5 as well for old WPA1 dumps;
+    # a mismatch is not an error, it just means the other algorithm applies.
+    digests = [hashlib.sha1]
+    if mic_version == 1:
+        digests.append(hashlib.md5)
+    for digest in digests:
+        calc = hmac.new(kck, bytes(body), digest).digest()[:MIC_LEN]
+        if hmac.compare_digest(calc, mic):
+            return True, 'EAPOL MIC'
+    return False, 'EAPOL MIC'
+
+
+def parse_hashes(path):
+    """Return (hashes, errors) from a 22000 file."""
+    hashes = []
+    errors = []
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        return [], ['cannot read %s: %s' % (path, exc)]
+    if size > MAX_FILE_BYTES:
+        return [], ['hash file is larger than %d bytes' % MAX_FILE_BYTES]
+    try:
+        with open(path, errors='ignore') as handle:
+            lines = handle.readlines()
+    except OSError as exc:
+        return [], ['cannot read %s: %s' % (path, exc)]
+
+    for number, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = line.split('*')
+        if len(parts) < 6 or parts[0] != 'WPA' or parts[1] not in ('01', '02'):
+            errors.append('line %d is not a 22000 hash' % number)
+            continue
+        hashes.append((parts, number))
+        if len(hashes) >= MAX_HASHES:
+            errors.append('stopped after %d hashes' % MAX_HASHES)
+            break
+    return hashes, errors
+
+
+def convert_pcap(pcap):
+    """Convert a pcap to 22000 with hcxpcapngtool; returns (path, error)."""
+    tool = shutil.which('hcxpcapngtool')
+    if not tool:
+        return None, 'hcxpcapngtool is not installed (apt install hcxtools)'
+    if not os.path.exists(pcap):
+        return None, 'capture not found: %s' % pcap
+    tmpdir = tempfile.mkdtemp(prefix='pinapple-psk-')
+    out = os.path.join(tmpdir, 'capture.22000')
+    try:
+        result = subprocess.run([tool, '-o', out, pcap],
+                                capture_output=True, text=True, timeout=90)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, 'hcxpcapngtool failed: %s' % exc
+    if not os.path.exists(out):
+        detail = (result.stderr or result.stdout or '').strip().splitlines()
+        return None, ('no handshake found in the capture'
+                      + (': ' + detail[-1][:160] if detail else ''))
+    return out, ''
+
+
+def hash_matches(parts, passphrase, ssid_filter, bssid_filter, cache):
+    """Return (status, method, detail) for one 22000 line."""
+    ap = mac_from_hex(parts[3] if len(parts) > 3 else '')
+    if bssid_filter and ap != bssid_filter:
+        return 'skip', '', 'different BSSID'
+    essid = clean_hex(parts[5] if len(parts) > 5 else '')
+    if ssid_filter and essid != ssid_filter:
+        return 'skip', '', 'different SSID'
+
+    if parts[1] == '01':
+        ok, detail = verify_pmkid(parts, passphrase, cache)
+    else:
+        ok, detail = verify_eapol(parts, passphrase, cache)
+    if ok is None:
+        return 'unsupported', '', detail
+    return ('ok' if ok else 'invalid'), ('pmkid' if parts[1] == '01' else 'eapol'), detail
+
+
+def run(args):
+    payload = {'result': 'error', 'method': '', 'checked': 0,
+               'detail': '', 'elapsed_ms': 0}
+    started = time.perf_counter()
+    tmp_hash = None
+    code = 2
+    try:
+        passphrase = args.passphrase
+        if not 8 <= len(passphrase.encode('utf-8', 'ignore')) <= 63:
+            payload['detail'] = 'a WPA passphrase is 8-63 characters'
+            return code, payload
+
+        hash_file = args.hash_file
+        if not hash_file and args.pcap:
+            hash_file, error = convert_pcap(args.pcap)
+            if not hash_file:
+                payload['detail'] = error
+                return code, payload
+            tmp_hash = hash_file
+        if not hash_file:
+            payload['detail'] = 'give --hash-file or --pcap'
+            return code, payload
+
+        hashes, errors = parse_hashes(hash_file)
+        if not hashes:
+            payload['detail'] = '; '.join(errors) or 'no 22000 hashes in the file'
+            return code, payload
+
+        ssid_filter = args.ssid.encode('utf-8', 'ignore') if args.ssid else b''
+        bssid_filter = mac_from_hex(args.bssid.replace(':', '').replace('-', ''))
+        cache = {}
+        checked = 0
+        unsupported = 0
+        skipped = 0
+        for parts, _number in hashes:
+            status, method, detail = hash_matches(
+                parts, passphrase, ssid_filter, bssid_filter, cache)
+            if status == 'skip':
+                skipped += 1
+                continue
+            if status == 'unsupported':
+                unsupported += 1
+                if not payload['detail']:
+                    payload['detail'] = detail
+                continue
+            checked += 1
+            payload['checked'] = checked
+            if status == 'ok':
+                payload.update({'result': 'ok', 'method': method,
+                                'detail': 'passphrase matches'})
+                return 0, payload
+            if not payload['detail']:
+                payload['detail'] = detail
+
+        if checked:
+            payload.update({'result': 'invalid',
+                            'detail': 'passphrase does not match the capture'})
+            code = 1
+        elif unsupported:
+            payload.update({'result': 'unsupported',
+                            'detail': payload['detail'] or
+                            'capture cannot be verified offline'})
+            code = 3
+        else:
+            payload['detail'] = ('no hash matched the requested SSID/BSSID'
+                                 if skipped else 'no usable hash')
+        return code, payload
+    finally:
+        if tmp_hash:
+            shutil.rmtree(os.path.dirname(tmp_hash), ignore_errors=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Check one passphrase against a 22000 handshake/PMKID')
+    parser.add_argument('--hash-file', default='',
+                        help='22000 file (hcxpcapngtool output)')
+    parser.add_argument('--pcap', default='',
+                        help='convert this pcap/cap with hcxpcapngtool first')
+    parser.add_argument('--passphrase', required=True,
+                        help="the single candidate to check ('-' reads stdin)")
+    parser.add_argument('--ssid', default='', help='only hashes for this SSID')
+    parser.add_argument('--bssid', default='', help='only hashes for this BSSID')
+    args = parser.parse_args()
+    if args.passphrase == '-':
+        # Keep the passphrase out of `ps`; the dashboard feeds it on stdin.
+        args.passphrase = sys.stdin.readline().rstrip('\r\n')
+
+    started = time.perf_counter()
+    code, payload = run(args)
+    payload['elapsed_ms'] = int((time.perf_counter() - started) * 1000)
+    print(json.dumps(payload))
+    return code
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # never leak a traceback into a portal request
+        print(json.dumps({'result': 'error', 'detail': str(exc),
+                          'method': '', 'checked': 0, 'elapsed_ms': 0}))
+        sys.exit(2)

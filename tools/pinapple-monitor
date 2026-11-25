@@ -104,6 +104,100 @@ def parse_radiotap(data):
     return length, channel, dbm
 
 
+CIPHER_NAMES = {0: 'GROUP', 1: 'WEP40', 2: 'TKIP', 3: 'WRAP', 4: 'CCMP',
+                5: 'WEP104', 6: 'AES-CMAC', 8: 'GCMP', 9: 'GCMP-256'}
+AKM_NAMES = {1: '802.1X', 2: 'PSK', 3: 'FT-802.1X', 4: 'FT-PSK',
+             5: '802.1X-SHA256', 6: 'PSK-SHA256', 7: 'TDLS', 8: 'SAE',
+             9: 'FT-SAE', 11: '802.1X-SUITE-B-192', 18: 'OWE'}
+
+
+def cipher_name(suite, vendor_oui=b'\x00\x0f\xac'):
+    if len(suite) < 4 or suite[:3] != vendor_oui:
+        return ''
+    return CIPHER_NAMES.get(suite[3], 'type-%d' % suite[3])
+
+
+def akm_name(suite, vendor_oui=b'\x00\x0f\xac'):
+    if len(suite) < 4 or suite[:3] != vendor_oui:
+        return ''
+    return AKM_NAMES.get(suite[3], 'type-%d' % suite[3])
+
+
+def parse_rsn(val, vendor_oui=b'\x00\x0f\xac'):
+    """Parse an RSN (tag 48) or WPA (vendor 221) information element.
+
+    Layout (802.11-2020 9.4.2.24): version(2) | group(4) | pairwise count(2)
+    | pairwise list(4n) | AKM count(2) | AKM list(4n) | capabilities(2)
+    | PMKID count(2) | PMKID list(16n). The WPA vendor IE has the same shape
+    with the Microsoft OUI. Truncated IEs are handled field by field.
+    """
+    out = {'group': '', 'pairwise': [], 'akm': []}
+    if len(val) < 6:
+        return out
+    out['group'] = cipher_name(val[2:6], vendor_oui)
+    pos = 6
+    if pos + 2 > len(val):
+        return out
+    count = int.from_bytes(val[pos:pos + 2], 'little')
+    pos += 2
+    for _ in range(min(count, 8)):
+        if pos + 4 > len(val):
+            break
+        name = cipher_name(val[pos:pos + 4], vendor_oui)
+        if name and name not in out['pairwise']:
+            out['pairwise'].append(name)
+        pos += 4
+    if pos + 2 > len(val):
+        return out
+    count = int.from_bytes(val[pos:pos + 2], 'little')
+    pos += 2
+    for _ in range(min(count, 8)):
+        if pos + 4 > len(val):
+            break
+        name = akm_name(val[pos:pos + 4], vendor_oui)
+        if name and name not in out['akm']:
+            out['akm'].append(name)
+        pos += 4
+    if pos + 2 <= len(val):
+        caps = int.from_bytes(val[pos:pos + 2], 'little')
+        out['pmf'] = 2 if caps & 0x0080 else (1 if caps & 0x0040 else 0)
+    return out
+
+
+def parse_security(body):
+    """Return the security detail the Evil Twin must clone, not just a label."""
+    detail = {'rsn': False, 'wpa': False, 'wpa3': False, 'sae': False,
+              'psk': False, 'eap': False, 'pmf': 0, 'wps': False,
+              'group': '', 'pairwise': [], 'akm': []}
+    i = 0
+    while i + 2 <= len(body):
+        tag = body[i]
+        ln = body[i + 1]
+        val = body[i + 2:i + 2 + ln]
+        i += 2 + ln
+        if tag == 48:
+            detail['rsn'] = True
+            detail.update(parse_rsn(val))
+        elif tag == 221 and val[:4] == b'\x00\x50\xf2\x01':
+            detail['wpa'] = True
+            legacy = parse_rsn(val[4:], b'\x00\x50\xf2')
+            if legacy['group'] and not detail['group']:
+                detail['group'] = legacy['group']
+            for name in legacy['pairwise']:
+                if name not in detail['pairwise']:
+                    detail['pairwise'].append(name)
+            for name in legacy['akm']:
+                if name not in detail['akm']:
+                    detail['akm'].append(name)
+        elif tag == 221 and val[:4] == b'\x00\x50\xf2\x04':
+            detail['wps'] = True
+    detail['sae'] = 'SAE' in detail['akm'] or 'FT-SAE' in detail['akm']
+    detail['psk'] = any(a in ('PSK', 'FT-PSK', 'PSK-SHA256') for a in detail['akm'])
+    detail['eap'] = any(a.startswith('802.1X') for a in detail['akm'])
+    detail['wpa3'] = detail['sae']
+    return detail
+
+
 def parse_tags(body):
     ssid = ''
     channel = 0
@@ -159,7 +253,12 @@ def parse_frame(data):
     if ftype == 0 and subtype in (8, 5):
         if len(frame) >= 36:
             ssid, channel, encryption = parse_tags(frame[36:])
-            result.update({'ssid': ssid, 'ap_channel': channel, 'encryption': encryption})
+            security = parse_security(frame[36:])
+            beacon_int = int.from_bytes(frame[32:34], 'little')
+            result.update({'ssid': ssid, 'ap_channel': channel,
+                           'encryption': encryption, 'security': security,
+                           'beacon_int': beacon_int,
+                           'band': '2.4' if 0 < channel <= 14 else '5'})
     elif ftype == 0 and subtype == 4:
         ssid, _, _ = parse_tags(frame[24:])
         result['ssid'] = ssid
@@ -305,6 +404,8 @@ def main():
                 'signal': item.get('signal', 0),
                 'signal_unit': item.get('signal_unit', 'dBm'),
                 'encryption': item.get('encryption', 'Open'),
+                'security': item.get('security') or {},
+                'band': item.get('band') or ('2.4' if 0 < int(item.get('channel', 0) or 0) <= 14 else '5'),
                 'first_seen': item.get('first_seen') or now_text(),
                 'last_seen': item.get('last_seen') or now_text(),
                 'last_epoch': time.time(),
@@ -437,6 +538,9 @@ def main():
                               'channel': parsed.get('ap_channel') or parsed['channel'] or 0,
                               'signal': parsed['dbm'] if parsed['dbm'] is not None else 0,
                               'signal_unit': 'dBm', 'encryption': parsed['encryption'],
+                              'security': parsed.get('security') or {},
+                              'band': parsed.get('band') or '',
+                              'beacon_int': parsed.get('beacon_int') or 0,
                               'first_seen': stamp}
                         aps[key] = ap
                     if parsed['ssid']:
@@ -445,6 +549,12 @@ def main():
                         ap['channel'] = parsed['ap_channel']
                     if parsed['dbm'] is not None:
                         ap['signal'] = parsed['dbm']
+                    if parsed.get('security'):
+                        ap['security'] = parsed['security']
+                    if parsed.get('beacon_int'):
+                        ap['beacon_int'] = parsed['beacon_int']
+                    if parsed.get('band'):
+                        ap['band'] = parsed['band']
                     ap['encryption'] = parsed['encryption']
                     ap['last_seen'] = stamp
                     ap['last_epoch'] = time.time()

@@ -15,6 +15,7 @@ import subprocess
 
 LOG_DIR = '/var/log/pinapple'
 SAVED_INDEX = '/var/lib/pinapple/saved.json'
+IW = shutil.which('iw') or '/usr/sbin/iw'
 SERVICES = [
     ('pinapple-dashboard', 'Dashboard'),
     ('pinapple-ap', 'AP (hostapd)'),
@@ -28,6 +29,7 @@ PID_FILES = [
     ('Deauth', '/var/run/pinapple-deauth.pid', 'pinapple-deauth'),
     ('PMKID', '/var/run/pinapple-pmkid.pid', 'hcxdumptool'),
     ('Evil Twin', '/var/run/pinapple-eviltwin.pid', 'pinapple-deauth'),
+    ('HTTPS downgrade', '/var/run/pinapple-strip.pid', 'pinapple-strip'),
 ]
 
 
@@ -51,7 +53,7 @@ def iface_ip(name):
 
 
 def wlan1_mode():
-    rc, out, _ = run(['iw', 'dev', 'wlan1', 'info'])
+    rc, out, _ = run([IW, 'dev', 'wlan1', 'info'])
     if rc != 0:
         return 'missing'
     for line in out.splitlines():

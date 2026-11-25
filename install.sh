@@ -34,7 +34,7 @@ apt-get update
 # 4. apt-get install system dependencies
 apt-get install -y hostapd dnsmasq aircrack-ng hcxdumptool hcxtools \
     macchanger iw wireless-tools net-tools rfkill usbutils nginx iptables ieee-data \
-    logrotate python3 python3-pip python3-venv network-manager tcpdump wpasupplicant
+    ca-certificates logrotate python3 python3-pip python3-venv network-manager tcpdump wpasupplicant
 
 # mdk4 is packaged separately from aircrack-ng and is not present on every
 # image. Fall back to a source build so beacon flooding works out of the box.
@@ -66,7 +66,7 @@ mkdir -p /opt/pinapple
 cp -f "$SCRIPT_DIR/app.py" "$SCRIPT_DIR/extensions.py" "$SCRIPT_DIR/ext_helpers.py" /opt/pinapple/
 cp -f "$SCRIPT_DIR/portal_handler.py" /opt/pinapple/
 mkdir -p /opt/pinapple/portal
-for f in creds hotel splash success coffee airport library gym; do
+for f in creds hotel splash success coffee airport library gym wifi-psk; do
     cp -f "$SCRIPT_DIR/portal/$f.html" /opt/pinapple/portal/
 done
 # Keep an existing portal selection (a symlink created by Settings).
@@ -84,6 +84,8 @@ install -m 0755 "$SCRIPT_DIR/tools/pinapple-status" /usr/local/bin/pinapple-stat
 install -m 0755 "$SCRIPT_DIR/tools/pinapple-internet" /usr/local/bin/pinapple-internet
 install -m 0755 "$SCRIPT_DIR/tools/pinapple-portal" /usr/local/bin/pinapple-portal
 install -m 0755 "$SCRIPT_DIR/tools/pinapple-psk-check" /usr/local/bin/pinapple-psk-check
+install -m 0755 "$SCRIPT_DIR/tools/pinapple-psk-verify" /usr/local/bin/pinapple-psk-verify
+install -m 0755 "$SCRIPT_DIR/tools/pinapple-strip" /usr/local/bin/pinapple-strip
 
 # 8. Sanity check that app.py binds 0.0.0.0
 if grep -q "app.run(host='0.0.0.0'" /opt/pinapple/app.py || grep -q 'app.run(host="0.0.0.0"' /opt/pinapple/app.py; then
@@ -145,6 +147,13 @@ install -m 0644 "$SCRIPT_DIR/services/pinapple-portal.service" /etc/systemd/syst
 systemctl daemon-reload
 systemctl enable pinapple-portal || true
 systemctl restart pinapple-portal || echo "WARNING: portal handler service failed to start."
+
+# 12b. HTTPS downgrade proxy. Installed but deliberately NOT enabled: it is
+#      started from the dashboard and leaves port-80 traffic redirection behind
+#      when it runs, so it must never come up on its own after a reboot.
+install -m 0644 "$SCRIPT_DIR/services/pinapple-strip.service" /etc/systemd/system/pinapple-strip.service
+systemctl daemon-reload
+systemctl disable --now pinapple-strip 2>/dev/null || true
 
 # 13. Install the systemd unit
 cp -f "$SCRIPT_DIR/pinapple-dashboard.service" /etc/systemd/system/pinapple-dashboard.service

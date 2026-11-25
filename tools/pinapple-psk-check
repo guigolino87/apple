@@ -102,6 +102,10 @@ def main():
     ap.add_argument('--bssid', default='')
     ap.add_argument('--psk', required=True)
     ap.add_argument('--channel', type=int, default=0)
+    ap.add_argument('--pmf', type=int, default=1,
+                    help='802.11w: 0 disabled, 1 optional, 2 required')
+    ap.add_argument('--wpa3', action='store_true',
+                    help='target is WPA3-SAE (verifies the password live)')
     ap.add_argument('--timeout', type=float, default=20.0)
     args = ap.parse_args()
 
@@ -147,12 +151,22 @@ def main():
             handle.write('\tssid="%s"\n' % ssid.replace('"', ''))
             if bssid:
                 handle.write('\tbssid=%s\n' % bssid)
-            handle.write('\tpsk="%s"\n' % psk.replace('"', ''))
-            # This AP class advertises RSN with a TKIP group cipher and CCMP
-            # pairwise; being explicit avoids "pre-shared key may be incorrect"
-            # when the negotiated group cipher does not match.
-            handle.write('\tkey_mgmt=WPA-PSK\n\tproto=RSN WPA\n'
-                         '\tpairwise=CCMP\n\tgroup=CCMP TKIP\n\tscan_ssid=1\n')
+            if args.wpa3:
+                # SAE verifies the password during authentication, so a live
+                # association is the only way to check a typed WPA3 key.
+                handle.write('\tsae_password="%s"\n' % psk.replace('"', ''))
+                handle.write('\tkey_mgmt=SAE\n\tproto=RSN\n'
+                             '\tpairwise=CCMP\n\tgroup=CCMP\n'
+                             '\tieee80211w=2\n\tscan_ssid=1\n')
+            else:
+                handle.write('\tpsk="%s"\n' % psk.replace('"', ''))
+                # This AP class advertises RSN with a TKIP group cipher and
+                # CCMP pairwise; being explicit avoids "pre-shared key may be
+                # incorrect" when the negotiated group cipher does not match.
+                handle.write('\tkey_mgmt=WPA-PSK\n\tproto=RSN WPA\n'
+                             '\tpairwise=CCMP\n\tgroup=CCMP TKIP\n\tscan_ssid=1\n')
+                if args.pmf:
+                    handle.write('\tieee80211w=%d\n' % (1 if args.pmf == 1 else 2))
             if args.channel:
                 # Scanning every channel is what made a check take 15-20s.
                 if args.channel == 14:
@@ -192,7 +206,9 @@ def main():
                 break
             if ('4-Way Handshake failed' in log or
                     'pre-shared key may be incorrect' in log or
-                    'CTRL-EVENT-AUTH-REJECT' in log):
+                    'CTRL-EVENT-AUTH-REJECT' in log or
+                    'SAE: Confirm message rejected' in log or
+                    'SAE: peer rejected' in log):
                 result, detail = 'invalid', 'the AP rejected the passphrase'
                 break
             if state in ('ASSOCIATING', 'ASSOCIATED', '4WAY_HANDSHAKE'):

