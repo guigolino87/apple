@@ -153,6 +153,70 @@ def service_status(name):
         return False
 
 
+def system_info():
+    """Cheap device health snapshot for the Settings page."""
+    def read(path):
+        try:
+            with open(path) as handle:
+                return handle.read().strip()
+        except OSError:
+            return ''
+
+    try:
+        up = float(read('/proc/uptime').split()[0])
+    except (ValueError, IndexError):
+        up = 0.0
+    days, rem = divmod(int(up), 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    uptime = ('%dd ' % days if days else '') + '%dh %02dm' % (hours, minutes)
+
+    temp = 'n/a'
+    raw = read('/sys/class/thermal/thermal_zone0/temp')
+    if raw.isdigit():
+        temp = '%.1f C' % (int(raw) / 1000.0)
+
+    memory = 'n/a'
+    try:
+        fields = {}
+        for line in read('/proc/meminfo').splitlines():
+            key, _, value = line.partition(':')
+            fields[key] = int(value.split()[0])
+        total = fields.get('MemTotal', 0)
+        avail = fields.get('MemAvailable', 0)
+        if total:
+            memory = '%.0f MB free of %.0f MB' % (avail / 1024.0, total / 1024.0)
+    except (ValueError, IndexError):
+        pass
+
+    disk = 'n/a'
+    try:
+        usage = shutil.disk_usage('/')
+        disk = '%.1f GB free of %.1f GB' % (usage.free / 1e9, usage.total / 1e9)
+    except OSError:
+        pass
+
+    try:
+        load = '%.2f  %.2f  %.2f' % os.getloadavg()
+    except OSError:
+        load = 'n/a'
+
+    return {
+        'hostname': read('/proc/sys/kernel/hostname') or 'pinapple',
+        'uptime': uptime,
+        'temp': temp,
+        'memory': memory,
+        'disk': disk,
+        'load': load,
+        'services': {
+            'ap': service_status('pinapple-ap'),
+            'dhcp': service_status('pinapple-dhcp'),
+            'portal': service_status('pinapple-portal'),
+            'monitor': service_status('pinapple-monitor'),
+        },
+    }
+
+
 def write_json_atomic(path, value):
     """Write JSON through a temp file so readers never see it half-written.
 
@@ -1551,7 +1615,7 @@ nav a:hover{color:var(--txt);background:rgba(0,212,170,0.08)}
 nav a.active{color:var(--acc);background:rgba(0,212,170,0.1);border-left-color:var(--acc)}
 .nav-icon{font-size:1rem;width:20px;text-align:center}
 .sidebar-footer{padding:16px 20px;border-top:1px solid var(--bdr);font-size:0.7rem;color:var(--dim)}
-.main{margin-left:240px;flex:1}
+.main{margin-left:240px;flex:1;min-width:0}
 .topbar{background:var(--sb);border-bottom:1px solid var(--bdr);padding:16px 32px;display:flex;align-items:center;justify-content:space-between}
 .topbar h1{font-size:1.25rem;font-weight:600}
 .hamburger{display:none;background:none;border:none;color:var(--txt);font-size:1.5rem;cursor:pointer;margin-right:12px}
@@ -1708,15 +1772,16 @@ input[type=radio],input[type=checkbox]{accent-color:var(--acc)}
 }
 
 @media (max-width: 768px) {
+  html,body{max-width:100%;overflow-x:hidden}
   body{-webkit-text-size-adjust:100%}
   .sidebar{width:min(86vw,330px);transform:translateX(-100%);transition:transform 0.25s ease-in-out;display:flex;}
   .sidebar.open{transform:translateX(0);}
   .sidebar-close{display:inline-flex;}
-  .main{margin-left:0;}
+  .main{margin-left:0;min-width:0;}
   .topbar{position:sticky;top:0;z-index:80;padding:12px 16px;gap:8px;}
   .topbar h1{font-size:1.05rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
   .topbar #clk{display:none;}
-  .content{padding:14px 14px calc(80px + env(safe-area-inset-bottom));}
+  .content{padding:14px 14px calc(80px + env(safe-area-inset-bottom));max-width:100%;}
   .cards{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;}
   .fr,.grid2{grid-template-columns:1fr;}
   input,select,textarea{font-size:16px !important;}
@@ -1731,14 +1796,17 @@ input[type=radio],input[type=checkbox]{accent-color:var(--acc)}
   .sidebar.open + .sidebar-overlay{display:block;}
   .hamburger{display:inline-flex;align-items:center;justify-content:center;min-width:44px;min-height:44px;}
   .log-area{height:62vh;font-size:0.72rem;}
-  .twrap{background:transparent;border:none;overflow:visible;}
+  .twrap{background:transparent;border:none;overflow:visible;max-width:100%;}
   table.resp thead{display:none;}
-  table.resp,table.resp tbody,table.resp tr,table.resp td{display:block;width:100%;}
+  table.resp,table.resp tbody,table.resp tr,table.resp td{display:block;width:100%;max-width:100%;}
   table.resp tr{border:1px solid var(--bdr);border-radius:12px;margin:0 0 10px;padding:5px 0;background:var(--card);}
-  table.resp td{display:flex;align-items:baseline;justify-content:space-between;gap:14px;border:none;padding:7px 12px;text-align:right;font-size:0.82rem;word-break:break-word;}
-  table.resp td::before{content:attr(data-label);color:var(--dim);font-size:0.68rem;text-transform:uppercase;letter-spacing:0.06em;text-align:left;flex:0 0 38%;}
+  table.resp td{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:6px 14px;border:none;padding:7px 12px;text-align:right;font-size:0.82rem;word-break:break-word;overflow-wrap:anywhere;min-width:0;}
+  table.resp td::before{content:attr(data-label);color:var(--dim);font-size:0.68rem;text-transform:uppercase;letter-spacing:0.06em;text-align:left;flex:0 0 38%;min-width:0;}
+  table.resp td > *{min-width:0;max-width:100%;overflow-wrap:anywhere;}
+  table.resp code{white-space:normal;overflow-wrap:anywhere;}
   table.resp td[colspan]{display:block;text-align:center;}
   table.resp td[colspan]::before{content:'';}
+  .wl-modebar{flex-wrap:wrap;}
   .wl-tab{padding:11px 16px;font-size:0.86rem;}
   .status-card{padding:11px 12px;}
 }
@@ -2830,6 +2898,62 @@ def settings_page():
     gateway = iface_ip('wlan0') or '10.0.0.1'
     active = cfg.get('portal_type', 'creds')
     mn = '<div style="padding:12px;background:rgba(0,212,170,0.1);border-radius:8px;margin-bottom:16px">{}</div>'.format(msg) if msg else ''
+
+    device_card = """<div>
+<div class="sh"><span class="st">Device</span>
+  <button class="btn btn-outline" onclick="loadSystemInfo(this)" style="font-size:0.8rem">Refresh</button></div>
+<div class="card">
+  <div id="system-info" class="hint" style="margin:0;line-height:2">Loading device status...</div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:16px">
+    <button class="btn btn-outline" onclick="systemAction('restart-dashboard',this)">Restart dashboard</button>
+    <button class="btn btn-outline" onclick="systemAction('restart-monitor',this)">Restart monitor</button>
+    <button class="btn btn-outline" onclick="systemAction('reboot',this)">Reboot Pi</button>
+    <button class="btn btn-danger" onclick="systemAction('shutdown',this)">Shut down</button>
+  </div>
+  <div class="hint">Restarting the dashboard keeps the AP and its clients connected. A reboot takes ~30 s; the AP and dashboard come back by themselves. Shutdown needs physical power to start again.</div>
+</div></div>"""
+    device_js = """<script>
+async function loadSystemInfo(btn){
+  if(btn)busy(btn,true,'...');
+  try{
+    const r=await fetch('/api/system/info',{headers:{'Accept':'application/json'}});
+    if(!r.ok)return;
+    const d=await r.json();
+    const el=document.getElementById('system-info');
+    if(!el)return;
+    const onoff=v=>v?'<span style="color:var(--grn)">up</span>':'<span style="color:var(--red)">down</span>';
+    el.innerHTML=[
+      'Host: <strong>'+esc(d.hostname)+'</strong>',
+      'Uptime: '+esc(d.uptime),
+      'Temperature: '+esc(d.temp),
+      'Memory: '+esc(d.memory),
+      'Disk: '+esc(d.disk),
+      'Load: '+esc(d.load),
+      'AP '+onoff(d.services.ap)+' &middot; DHCP '+onoff(d.services.dhcp)+
+        ' &middot; Portal '+onoff(d.services.portal)+' &middot; Monitor '+onoff(d.services.monitor)
+    ].join('<br>');
+  }catch(e){}finally{if(btn)busy(btn,false);}
+}
+async function systemAction(action,btn){
+  const text={
+    'reboot':'Reboot the Pi? The dashboard and AP drop for about 30 seconds.',
+    'shutdown':'Shut the Pi down? You will need physical power to start it again.',
+    'restart-dashboard':'Restart only the dashboard? AP clients stay connected.',
+    'restart-monitor':'Restart the wlan1 monitor?'
+  }[action]||('Run '+action+'?');
+  if(!confirm(text))return;
+  busy(btn,true,'Working...');
+  const d=await api('/api/system/power','POST',{action:action});
+  if(d&&d.ok){
+    toast('Command sent. Reload the page when the Pi is back.','info',8000);
+    if(action==='restart-dashboard')setTimeout(()=>location.reload(),4000);
+  }else{
+    toast('Failed: '+((d&&d.error)||'unknown'),'error',6000);
+    busy(btn,false);
+  }
+}
+loadSystemInfo();
+</script>"""
     c = """{mn}<div style="display:grid;grid-template-columns:1fr;gap:24px">
 <div>
 <div class="sh"><span class="st">Portal Type</span>
@@ -2863,9 +2987,10 @@ The selected template is served on the captive portal; submissions redirect to
 </div>
 <button type="submit" class="btn btn-acc">Change Password</button>
 </form>
-<div class="hint">Changing the password may make your browser ask you to sign in again. The default password is <strong>pinapple</strong> — change it before using this in public.</div></div></div></div>""".format(
-        mn=mn, popts=popts, active=html_escape(str(active)), gateway=html_escape(str(gateway)))
-    return page('Settings', c, 'settings')
+<div class="hint">Changing the password may make your browser ask you to sign in again. The default password is <strong>pinapple</strong> — change it before using this in public.</div></div></div>{device_card}</div>""".format(
+        mn=mn, popts=popts, active=html_escape(str(active)),
+        gateway=html_escape(str(gateway)), device_card=device_card)
+    return page('Settings', c, 'settings', device_js)
 
 
 # ============================================================
@@ -2996,6 +3121,45 @@ def api_system_repair():
             results.append({'service': name, 'result': str(exc)})
     audit('System service repair requested', 'warn')
     return jsonify({'ok': True, 'results': results})
+
+
+@app.route('/api/system/info')
+@require_auth
+def api_system_info():
+    return jsonify(system_info())
+
+
+SYSTEM_ACTIONS = {
+    'restart-dashboard': ['systemctl', 'restart', 'pinapple-dashboard'],
+    'restart-monitor': ['systemctl', 'restart', 'pinapple-monitor'],
+    'reboot': ['systemctl', 'reboot'],
+    'shutdown': ['systemctl', 'poweroff'],
+}
+
+
+@app.route('/api/system/power', methods=['POST'])
+@require_auth
+def api_system_power():
+    """Reboot, power off or restart a service from the phone.
+
+    The command runs in a short-lived thread so the JSON response reaches the
+    browser before systemd takes the dashboard down.
+    """
+    action = str((request.json or {}).get('action', '')).strip()
+    cmd = SYSTEM_ACTIONS.get(action)
+    if not cmd:
+        return jsonify({'ok': False, 'error': 'unknown system action'})
+    audit('System action requested: %s' % action, 'warn')
+
+    def run():
+        time.sleep(1.5)
+        try:
+            subprocess.run(cmd, timeout=20)
+        except Exception:
+            pass
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({'ok': True, 'action': action})
 
 
 @app.route('/api/status/summary')
