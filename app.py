@@ -2885,6 +2885,11 @@ def strip_page():
         pbadge(bool(status.get('rules', {}).get('redirect')), 'port 80 redirected'))
 
     dot = '<span class="sdot %s" id="st-dot"></span>' % ('on' if running else 'off')
+    ap_conf = read_hostapd_conf()
+    ap_ssid = ap_conf.get('ssid') or 'PiNAPPLE'
+    ap_open = str(ap_conf.get('wpa') or '0') == '0'
+    sec_note = ('Broadcast as open Wi-Fi, no password.' if ap_open
+                else 'Broadcast as WPA2-PSK, password unchanged.')
     rules = status.get('rules') or {}
     stray = ('<div class="warnbox"><strong>The proxy is not running, but port 80 is '
              'still redirected.</strong> Clients cannot browse until it is stopped. '
@@ -2901,13 +2906,20 @@ def strip_page():
     c = """<div class="sh"><span class="st">HTTPS Downgrade (sslstrip)</span>
 <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
 <select id="st-mode-ctl" aria-label="HTTPS policy">
-  <option value="block"{mb}>block 443 &mdash; demo the refusal</option>
-  <option value="allow"{ma}>allow 443 &mdash; encrypted, invisible</option>
+  <option value="block"{mb}>block 443 &mdash; show refusals (demo)</option>
+  <option value="allow"{ma}>allow 443 &mdash; encrypted, unreadable</option>
 </select>
 <button class="{tcls}" data-on="{on}" onclick="toggleStrip(this)">{tlabel}</button>
 <button class="btn btn-outline" onclick="refreshStrip(true)">Refresh</button>
 <button class="btn btn-outline" onclick="clearStrip()">Clear log</button>
 </div></div>
+<div class="hint" style="margin:-8px 0 14px;line-height:1.55">
+<strong>block 443</strong> answers every connection the phone forces to HTTPS with an
+error, so a site that refuses the downgrade fails visibly and <em>TLS refused</em>
+increments. <strong>allow 443</strong> lets those connections through encrypted: the site
+works normally, but nothing inside it can be read. The choice applies the next time you
+press Start.
+</div>
 {stray}
 
 <div class="cards">
@@ -2926,6 +2938,14 @@ def strip_page():
 </div>
 
 <div style="margin-bottom:16px">{badges}</div>
+
+<div class="tg" style="flex-wrap:wrap;gap:12px">
+<div class="tl"><strong>Network name (SSID)</strong>
+  <span>{sec_note} Renaming restarts the AP and drops every client.</span></div>
+<input id="st-ssid" value="{ssid}" maxlength="32" aria-label="SSID"
+       style="max-width:220px;min-width:150px;flex:0 1 220px">
+<button class="btn btn-outline" onclick="saveSsid(this)">Apply</button>
+</div>
 
 <div class="twrap" style="padding:14px 16px;margin-bottom:16px">
 <div class="hint" style="margin:0;line-height:1.6">
@@ -2960,7 +2980,7 @@ refuse to downgrade at all, show up in the two tables above.
 </div></div>""".format(
         mb=mode_block, ma=mode_allow, tcls=toggle_cls, tlabel=toggle_label,
         on='1' if running else '0', dot=dot, running=running_txt, port=port,
-        stray=stray,
+        stray=stray, ssid=html_escape(str(ap_ssid)), sec_note=sec_note,
         mode=html_escape(mode), reqs=len(records), clients=clients,
         down=downgraded, blocked=blocked,
         blocked_sub=('udp + tcp 443 rejected' if mode == 'block'
@@ -3012,6 +3032,21 @@ async function clearStrip(){
   const r=await api('/api/strip/clear','POST',{});
   if(r&&r.ok){toast('Cleared '+(r.cleared||0)+' record(s)','success');refreshStrip(true);}
   else toast('Could not clear: '+((r&&r.error)||'unknown'),'error',6000);
+}
+async function saveSsid(btn){
+  const input=document.getElementById('st-ssid');
+  const ssid=(input.value||'').trim();
+  if(!ssid){toast('SSID cannot be empty','error');return;}
+  if(!confirm('Rename the AP to "'+ssid+'"?\\n\\nEvery connected device drops off and has to rejoin. The downgrade rules stay up.'))return;
+  busy(btn,true,'Applying\\u2026');
+  const r=await api('/api/strip/ssid','POST',{ssid:ssid});
+  busy(btn,false);
+  if(r&&r.ok){
+    input.value=r.ssid;
+    toast('AP is now "'+r.ssid+'" ('+r.security+'). Rejoin it from the phone.','success',9000);
+  }else{
+    toast('Rename failed: '+((r&&r.error)||'unknown'),'error',9000);
+  }
 }
 setInterval(function(){refreshStrip(false);},4000);
 </script>"""
@@ -3108,6 +3143,54 @@ def api_strip_clear():
             pass
     audit('HTTPS downgrade log cleared (%d file(s))' % len(cleared))
     return jsonify({'ok': True, 'cleared': len(cleared)})
+
+
+@app.route('/api/strip/ssid', methods=['POST'])
+@require_auth
+def api_strip_ssid():
+    """Rename the AP without touching its security mode or channel."""
+    data = request.json or {}
+    cleaned = ''.join(ch for ch in str(data.get('ssid') or '')
+                      if ord(ch) >= 32 and ord(ch) != 127)[:32].strip()
+    if not cleaned:
+        return jsonify({'ok': False, 'error': 'SSID cannot be empty'})
+    if ap_backend() != 'hostapd':
+        return jsonify({'ok': False,
+                        'error': 'This install uses the NetworkManager hotspot; '
+                                 'rename it from AP Control.'})
+    conf = read_hostapd_conf()
+    try:
+        channel = int(conf.get('channel') or 6)
+    except (TypeError, ValueError):
+        channel = 6
+    mode = 'open' if str(conf.get('wpa') or '0') == '0' else 'wpa2'
+    passphrase = conf.get('wpa_passphrase') or None
+    txpower = read_ap_txpower()
+    previous = ''
+    try:
+        with open(HOSTAPD_CONF) as handle:
+            previous = handle.read()
+        write_hostapd_conf(cleaned, channel, mode, txpower, passphrase)
+    except OSError as exc:
+        return jsonify({'ok': False, 'error': 'Could not write config: %s' % exc})
+    result = subprocess.run(['systemctl', 'restart', 'pinapple-ap'],
+                            capture_output=True, text=True, timeout=25)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or 'unknown'
+        if previous:      # never leave the AP dead on a rejected config
+            try:
+                with open(HOSTAPD_CONF, 'w') as handle:
+                    handle.write(previous)
+                subprocess.run(['systemctl', 'restart', 'pinapple-ap'],
+                               capture_output=True, timeout=20)
+            except OSError:
+                pass
+        return jsonify({'ok': False, 'error': 'AP restart failed: %s' % detail[:300]})
+    subprocess.run(['systemctl', 'restart', 'pinapple-dhcp'],
+                   capture_output=True, timeout=15)
+    audit('AP renamed to %s' % cleaned)
+    return jsonify({'ok': True, 'ssid': read_hostapd_conf().get('ssid', cleaned),
+                    'security': mode})
 
 
 @app.route('/clients')

@@ -300,6 +300,8 @@ curl -sI http://yoursite.tld        # 301/308 to https = it refuses to be downgr
 ### Demo checklist (before recording)
 
 - AP security set to **Open** in AP Control, so a fresh device can join without a prompt.
+- The AP name can be changed on the same page (**Network name / SSID**); it keeps the
+  current security mode and channel, and drops every client when it restarts.
 - **Internet Passthrough ON**, **DNS Hijack OFF**, **Portal Redirect OFF**. Starting the
   downgrade turns the last two off automatically, because all three want port 80.
 - Use a phone that has never visited the test domain, or clear site data. A cached HSTS

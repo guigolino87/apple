@@ -925,6 +925,65 @@ BSS 20:b0:01:ea:10:4f(on wlan1)
             shutil.rmtree(root, ignore_errors=True)
 
 
+    def test_strip_ssid_applies_and_keeps_security(self):
+        import shutil
+        root = tempfile.mkdtemp(prefix='pinapple-ssid-')
+        names = ('HOSTAPD_CONF', 'ap_backend', 'read_ap_txpower')
+        old = {name: getattr(self.app, name) for name in names}
+        original_req = self.app.request
+        try:
+            conf = os.path.join(root, 'hostapd.conf')
+            with open(conf, 'w') as handle:
+                handle.write('interface=wlan0\nssid=Old Name\nchannel=6\n'
+                             'auth_algs=1\nignore_broadcast_ssid=0\n')
+            self.app.HOSTAPD_CONF = conf
+            self.app.ap_backend = lambda: 'hostapd'
+            self.app.read_ap_txpower = lambda: 'medium'
+
+            self.app.request = types.SimpleNamespace(json={'ssid': '   '},
+                                                     form={}, method='POST')
+            result = self.app.api_strip_ssid.__wrapped__()
+            self.assertFalse(result['ok'])
+            self.assertIn('empty', result['error'])
+
+            self.app.request = types.SimpleNamespace(json={'ssid': 'Free Cafe WiFi'},
+                                                     form={}, method='POST')
+            with mock.patch.object(self.app.subprocess, 'run',
+                                   return_value=mock.Mock(returncode=0)), \
+                    mock.patch.object(self.app, 'read_country_code',
+                                      return_value=''):
+                result = self.app.api_strip_ssid.__wrapped__()
+            self.assertTrue(result['ok'], result)
+            self.assertEqual(result['ssid'], 'Free Cafe WiFi')
+            self.assertEqual(result['security'], 'open')
+            with open(conf) as handle:
+                written = handle.read()
+            self.assertIn('ssid=Free Cafe WiFi', written)
+            self.assertIn('channel=6', written)
+            self.assertNotIn('wpa=', written)
+        finally:
+            for name, value in old.items():
+                setattr(self.app, name, value)
+            self.app.request = original_req
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_strip_ssid_refuses_non_hostapd_backend(self):
+        names = ('ap_backend',)
+        old = {name: getattr(self.app, name) for name in names}
+        original_req = self.app.request
+        try:
+            self.app.ap_backend = lambda: 'networkmanager'
+            self.app.request = types.SimpleNamespace(json={'ssid': 'Lab'},
+                                                     form={}, method='POST')
+            result = self.app.api_strip_ssid.__wrapped__()
+            self.assertFalse(result['ok'])
+            self.assertIn('AP Control', result['error'])
+        finally:
+            for name, value in old.items():
+                setattr(self.app, name, value)
+            self.app.request = original_req
+
+
 class PskVerifyTests(unittest.TestCase):
     """Known-good hashcat 22000 vectors (password: hashcat!)."""
 
