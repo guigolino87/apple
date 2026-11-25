@@ -4444,6 +4444,13 @@ def api_evil_twin_start():
             and str(scan_channel) != str(data.get('channel')):
         channel_notes.append('using the real target channel %d instead of %s'
                              % (scan_channel, data.get('channel')))
+    if not os.path.exists(FLAG_DNS) and not os.path.exists(FLAG_PORTAL):
+        channel_notes.append('the captive portal will not appear by itself: enable '
+                             'DNS Hijack or Portal Redirect on the Overview')
+    active_slug = _active_portal_slug()
+    if active_slug != 'wifi-psk':
+        channel_notes.append('active portal is "%s": select Router Update in Settings '
+                             'to validate passwords' % active_slug)
     psk = str(data.get('psk', '') or '').strip()
     if psk and not (8 <= len(psk.encode('utf-8', 'ignore')) <= 63):
         return jsonify({'ok': False,
