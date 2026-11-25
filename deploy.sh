@@ -27,7 +27,14 @@ if [[ ! -x "$PY" ]]; then
 fi
 
 echo "==> Syntax check"
-"$PY" -m py_compile app.py extensions.py ext_helpers.py portal_handler.py tools/pinapple-monitor
+"$PY" - <<'PY'
+files = ['app.py', 'extensions.py', 'ext_helpers.py', 'portal_handler.py',
+         'tools/pinapple-monitor']
+for name in files:
+    with open(name, encoding='utf-8') as handle:
+        compile(handle.read(), name, 'exec')
+print('syntax ok (%d files)' % len(files))
+PY
 
 echo "==> Installing dashboard code"
 install -m 0644 app.py extensions.py ext_helpers.py portal_handler.py "$DEST/"
