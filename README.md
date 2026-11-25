@@ -120,6 +120,8 @@ Only one feature can own `wlan1` at a time: starting a beacon flood stops deauth
 
 **Evil Twin** rebuilds `wlan0` into a clone of the target (SSID, BSSID, channel) and deauths the real AP from `wlan1` so clients look for the twin. The rebuild runs in a worker thread after the HTTP response, because stopping `pinapple-ap` also takes down the AP that serves the dashboard. A phone will only auto-join a clone whose security matches what it saved: cloning a WPA2 network as open makes iOS/Android prompt for the old password and fail ("unable to connect"). Supply the recovered passphrase in the optional field to build a WPA2 twin that matches the saved profile, or target an SSID the device does not have saved (or forget the network first) for an open twin.
 
+With the **Router Update** portal selected, a submitted Wi-Fi password is verified for real: `pinapple-psk-check` moves `wlan1` to managed mode, associates to the target BSSID with the submitted PSK and reports whether the WPA2 4-way handshake completed. A wrong password gets an "incorrect password" page, a correct one is stored in Credentials, shown as the last Evil Twin capture, and the twin is shut down so the victim reconnects to the real AP. The twin also records EAPOL frames on its channel and converts them to a hashcat `.22000`, which is the way to obtain a PSK for a saved WPA2 network before that join is possible.
+
 All helpers are installed to `/usr/local/bin/` by `install.sh` and use only the Python standard library.
 
 ### Mobile dashboard

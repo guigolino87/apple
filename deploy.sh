@@ -52,6 +52,17 @@ echo "==> Installing dashboard unit"
 install -m 0644 pinapple-dashboard.service /etc/systemd/system/pinapple-dashboard.service
 systemctl daemon-reload
 
+if [[ -f portal/nginx-pinapple.conf ]]; then
+    echo "==> Installing nginx portal site"
+    install -m 0644 portal/nginx-pinapple.conf /etc/nginx/sites-available/pinapple
+    ln -sf /etc/nginx/sites-available/pinapple /etc/nginx/sites-enabled/pinapple
+    if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx || true
+    else
+        echo "WARNING: nginx rejected the site config; portal submit stays on the old route" >&2
+    fi
+fi
+
 echo "==> Restarting dashboard"
 systemctl restart pinapple-dashboard
 

