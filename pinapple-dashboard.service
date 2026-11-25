@@ -1,14 +1,16 @@
 [Unit]
 Description=PiNAPPLE Dashboard
-After=network.target
+After=network.target pinapple-ap.service pinapple-dhcp.service
+Wants=pinapple-ap.service pinapple-dhcp.service
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/opt/pinapple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/opt/pinapple/venv/bin/python3 /opt/pinapple/app.py
-Restart=on-failure
-RestartSec=5
+Restart=always
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# PiNAPPLE HTTP captive-portal redirect toggle (idempotent).
+# Redirects client HTTP traffic on wlan0 to nginx on the gateway.
+# Usage: pinapple-portal on|off
+set -euo pipefail
+
+action="${1:-on}"
+ap="wlan0"
+
+case "$action" in
+  on)
+    iptables -w -t nat -C PREROUTING -i "$ap" -p tcp --dport 80 -j REDIRECT --to-ports 80 2>/dev/null \
+      || iptables -w -t nat -A PREROUTING -i "$ap" -p tcp --dport 80 -j REDIRECT --to-ports 80
+    echo "portal redirect on"
+    ;;
+  off)
+    iptables -w -t nat -D PREROUTING -i "$ap" -p tcp --dport 80 -j REDIRECT --to-ports 80 2>/dev/null || true
+    echo "portal redirect off"
+    ;;
+  *)
+    echo "usage: $0 on|off" >&2
+    exit 1
+    ;;
+esac

@@ -1,0 +1,15 @@
+[Unit]
+Description=PiNAPPLE wlan1 monitor and scanner
+After=network.target
+
+[Service]
+Type=simple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 /usr/local/bin/pinapple-monitor --interface wlan1 --channels 1-13 --dwell 0.45
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/pinapple/monitor.log
+StandardError=append:/var/log/pinapple/monitor.log
+
+[Install]
+WantedBy=multi-user.target

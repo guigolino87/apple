@@ -1,0 +1,14 @@
+[Unit]
+Description=PiNAPPLE DHCP and DNS (dnsmasq on wlan0)
+After=pinapple-ap.service
+PartOf=pinapple-ap.service
+
+[Service]
+Type=simple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/sbin/dnsmasq --no-daemon --conf-file=/etc/dnsmasq.d/pinapple.conf
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

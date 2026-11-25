@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+"""PiNAPPLE wlan1 monitor (authorized lab use only).
+
+Puts wlan1 in monitor mode, hops 2.4 GHz channels, parses 802.11 frames from a
+raw AF_PACKET socket, and writes three readable JSON snapshots:
+
+    /var/log/pinapple/probes.json       devices + SSIDs they probe for
+    /var/log/pinapple/clients_seen.json every device + packet types / SSIDs
+    /var/log/pinapple/scan.json         observed APs (SSID/BSSID/channel/RSSI)
+
+Existing snapshots are loaded on start and merged, so a reboot or service
+restart does not erase collected data. Only the Python standard library is
+used; iw is required for channel changes.
+"""
+
+import argparse
+import json
+import os
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+_stop = False
+BCAST = b'\xff\xff\xff\xff\xff\xff'
+ZERO = b'\x00\x00\x00\x00\x00\x00'
+
+PACKET_TYPES = {
+    (0, 0): 'assoc-req',
+    (0, 4): 'probe-req',
+    (0, 5): 'beacon',       # probe response
+    (0, 8): 'beacon',
+    (0, 11): 'auth',
+    (0, 12): 'deauth',
+    (0, 10): 'deauth',
+    (2, 0): 'data',
+}
+
+
+def note(message):
+    print('%s %s' % (time.strftime('%H:%M:%S'), message), flush=True)
+
+
+def handle_signal(signum, frame):
+    global _stop
+    _stop = True
+
+
+def mac(value):
+    return ':'.join('%02x' % b for b in value)
+
+
+def clean_text(value):
+    if isinstance(value, bytes):
+        value = value.decode('utf-8', 'replace')
+    return ''.join(ch if ord(ch) >= 32 and ord(ch) != 127 else ' ' for ch in value).strip()
+
+
+def freq_to_channel(freq):
+    if 2412 <= freq <= 2484:
+        return 14 if freq == 2484 else (freq - 2407) // 5
+    if 5000 <= freq <= 5900:
+        return (freq - 5000) // 5
+    return 0
+
+
+def parse_radiotap(data):
+    """Return (header_len, channel, dbm) or (0, 0, None)."""
+    if len(data) < 8:
+        return 0, 0, None
+    length = struct.unpack_from('<H', data, 2)[0]
+    if length < 8 or length > len(data):
+        return 0, 0, None
+    pos = 4
+    words = []
+    while True:
+        if pos + 4 > length:
+            return 0, 0, None
+        word = struct.unpack_from('<I', data, pos)[0]
+        words.append(word)
+        pos += 4
+        if not (word & 0x80000000):
+            break
+    present = words[0]
+    channel = 0
+    dbm = None
+    sizes = ((0, 8, 8), (1, 1, 1), (2, 1, 1), (3, 4, 2),
+             (4, 2, 2), (5, 1, 1), (6, 1, 1), (7, 2, 2))
+    for bit, size, align in sizes:
+        if not (present & (1 << bit)):
+            continue
+        if align > 1 and pos % align:
+            pos += align - (pos % align)
+        if pos + size > length:
+            return length, channel, dbm
+        if bit == 3:
+            freq = struct.unpack_from('<H', data, pos)[0]
+            channel = freq_to_channel(freq)
+        elif bit == 5:
+            dbm = struct.unpack_from('<b', data, pos)[0]
+        pos += size
+    return length, channel, dbm
+
+
+def parse_tags(body):
+    ssid = ''
+    channel = 0
+    rsn = False
+    wpa = False
+    wpa3 = False
+    i = 0
+    while i + 2 <= len(body):
+        tag = body[i]
+        ln = body[i + 1]
+        val = body[i + 2:i + 2 + ln]
+        i += 2 + ln
+        if tag == 0:
+            ssid = clean_text(val)
+        elif tag == 3 and ln >= 1:
+            channel = val[0]
+        elif tag == 48:
+            rsn = True
+            if b'\x00\x0f\xac\x08' in val:
+                wpa3 = True
+        elif tag == 221 and val[:4] == b'\x00\x50\xf2\x01':
+            wpa = True
+    encryption = 'WPA3' if wpa3 else ('WPA2' if rsn else ('WPA' if wpa else 'Open'))
+    return ssid, channel, encryption
+
+
+def parse_frame(data):
+    rt_len, rt_channel, dbm = parse_radiotap(data)
+    frame = data[rt_len:]
+    if len(frame) < 24:
+        return None
+    fc = struct.unpack_from('<H', frame, 0)[0]
+    ftype = (fc >> 2) & 3
+    subtype = (fc >> 4) & 0x0f
+    addr1 = frame[4:10]
+    addr2 = frame[10:16]
+    addr3 = frame[16:22]
+    kind = PACKET_TYPES.get((ftype, subtype))
+    if kind is None:
+        kind = 'mgmt' if ftype == 0 else ('data' if ftype == 2 else 'ctrl')
+    result = {
+        'kind': kind,
+        'type': ftype,
+        'subtype': subtype,
+        'addr1': addr1,
+        'addr2': addr2,
+        'addr3': addr3,
+        'channel': rt_channel,
+        'dbm': dbm,
+        'ssid': '',
+        'encryption': 'Open',
+    }
+    if ftype == 0 and subtype in (8, 5):
+        if len(frame) >= 36:
+            ssid, channel, encryption = parse_tags(frame[36:])
+            result.update({'ssid': ssid, 'ap_channel': channel, 'encryption': encryption})
+    elif ftype == 0 and subtype == 4:
+        ssid, _, _ = parse_tags(frame[24:])
+        result['ssid'] = ssid
+    return result
+
+
+def load_records(path):
+    try:
+        with open(path) as handle:
+            raw = handle.read().strip()
+        if not raw:
+            return []
+        if raw.startswith('['):
+            value = json.loads(raw)
+            return value if isinstance(value, list) else []
+        out = []
+        for line in raw.splitlines():
+            try:
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    out.append(item)
+            except ValueError:
+                pass
+        return out
+    except OSError:
+        return []
+
+
+def write_json(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = '%s.tmp.%d' % (path, os.getpid())
+    with open(tmp, 'w') as handle:
+        json.dump(value, handle, indent=2)
+    os.replace(tmp, path)
+
+
+def set_channel(iw, interface, channel):
+    try:
+        r = subprocess.run([iw, 'dev', interface, 'set', 'channel', str(channel)],
+                           capture_output=True, text=True, timeout=5)
+        return r.returncode == 0, (r.stderr or r.stdout).strip()
+    except OSError as exc:
+        return False, str(exc)
+
+
+def set_monitor(iw, ip, interface):
+    try:
+        subprocess.run([ip, 'link', 'set', interface, 'down'],
+                       capture_output=True, timeout=5)
+        r = subprocess.run([iw, 'dev', interface, 'set', 'type', 'monitor'],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout).strip()
+        subprocess.run([ip, 'link', 'set', interface, 'up'],
+                       capture_output=True, timeout=5)
+        return True, ''
+    except OSError as exc:
+        return False, str(exc)
+
+
+def now_text(epoch=None):
+    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(epoch or time.time()))
+
+
+def main():
+    parser = argparse.ArgumentParser(description='PiNAPPLE wlan1 monitor')
+    parser.add_argument('--interface', default='wlan1')
+    parser.add_argument('--channels', default='1-13',
+                        help='channel list or range, e.g. 1,6,11 or 1-13')
+    parser.add_argument('--dwell', type=float, default=0.45,
+                        help='seconds per channel (default 0.45)')
+    parser.add_argument('--log-dir', default='/var/log/pinapple')
+    parser.add_argument('--iw', default=None)
+    parser.add_argument('--ip', default=None)
+    args = parser.parse_args()
+
+    iw = args.iw or 'iw'
+    ip_bin = args.ip or 'ip'
+    if not 0.15 <= args.dwell <= 5:
+        raise SystemExit('dwell must be between 0.15 and 5 seconds')
+
+    channels = []
+    for part in str(args.channels).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            lo, hi = part.split('-', 1)
+            try:
+                lo, hi = int(lo), int(hi)
+            except ValueError:
+                raise SystemExit('invalid channel range: %s' % part)
+            channels.extend(range(min(lo, hi), max(lo, hi) + 1))
+        else:
+            try:
+                channels.append(int(part))
+            except ValueError:
+                raise SystemExit('invalid channel: %s' % part)
+    channels = [c for c in dict.fromkeys(channels) if 1 <= c <= 14]
+    if not channels:
+        raise SystemExit('no valid 2.4GHz channels')
+
+    probes_path = os.path.join(args.log_dir, 'probes.json')
+    tracker_path = os.path.join(args.log_dir, 'clients_seen.json')
+    scan_path = os.path.join(args.log_dir, 'scan.json')
+    status_path = os.path.join(args.log_dir, 'monitor_status.json')
+    os.makedirs(args.log_dir, exist_ok=True)
+
+    probes = {}
+    for item in load_records(probes_path):
+        key = (str(item.get('mac', '')), str(item.get('ssid', '')))
+        if key[0] and key[1]:
+            probes[key] = {
+                'mac': key[0], 'ssid': key[1],
+                'first_seen': item.get('first_seen') or now_text(),
+                'last_seen': item.get('last_seen') or now_text(),
+                'count': int(item.get('count', 1) or 1),
+                'last_epoch': time.time(),
+            }
+
+    tracker = {}
+    for item in load_records(tracker_path):
+        mac_addr = str(item.get('mac', '')).lower()
+        if mac_addr:
+            tracker[mac_addr] = {
+                'mac': mac_addr,
+                'first_seen': item.get('first_seen') or now_text(),
+                'last_seen': item.get('last_seen') or now_text(),
+                'packet_types': item.get('packet_types') or {},
+                'ssids': list(item.get('ssids') or []),
+                'count': int(item.get('count', 0) or 0),
+                'last_epoch': time.time(),
+            }
+
+    aps = {}
+    for item in load_records(scan_path):
+        bssid = str(item.get('bssid', '')).lower()
+        if bssid:
+            aps[bssid] = {
+                'ssid': str(item.get('ssid', '') or ''),
+                'bssid': bssid,
+                'channel': int(item.get('channel', 0) or 0),
+                'signal': item.get('signal', 0),
+                'signal_unit': item.get('signal_unit', 'dBm'),
+                'encryption': item.get('encryption', 'Open'),
+                'first_seen': item.get('first_seen') or now_text(),
+                'last_seen': item.get('last_seen') or now_text(),
+                'last_epoch': time.time(),
+            }
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    sock = None
+    interface_ready = False
+    last_write = 0.0
+    dirty = True
+    channel_index = 0
+    next_hop = 0.0
+    last_channel_error = ''
+    last_status = 0.0
+    packets = 0
+    current_channel = 0
+
+    note('monitor starting on %s, channels %s, dwell %.2fs' % (
+        args.interface, ','.join(str(c) for c in channels), args.dwell))
+    write_json(status_path, {'state': 'starting', 'updated': now_text(),
+                             'updated_epoch': time.time(), 'channel': 0,
+                             'packets': 0, 'aps': 0, 'probes': 0, 'devices': 0})
+
+    while not _stop:
+        if not interface_ready:
+            if not os.path.exists('/sys/class/net/%s' % args.interface):
+                note('%s not present; waiting for the USB adapter' % args.interface)
+                if time.time() - last_status >= 5:
+                    write_json(status_path, {
+                        'state': 'waiting', 'updated': now_text(),
+                        'updated_epoch': time.time(), 'channel': 0,
+                        'packets': packets, 'aps': len(aps),
+                        'probes': len(probes), 'devices': len(tracker),
+                    })
+                    last_status = time.time()
+                time.sleep(5)
+                continue
+            ok, message = set_monitor(iw, ip_bin, args.interface)
+            if not ok:
+                note('could not set monitor mode: %s' % message)
+                if time.time() - last_status >= 5:
+                    write_json(status_path, {
+                        'state': 'error', 'updated': now_text(),
+                        'updated_epoch': time.time(), 'error': message,
+                        'channel': 0, 'packets': packets, 'aps': len(aps),
+                        'probes': len(probes), 'devices': len(tracker),
+                    })
+                    last_status = time.time()
+                time.sleep(5)
+                continue
+            try:
+                sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                                     socket.htons(0x0003))
+                sock.bind((args.interface, 0))
+                sock.settimeout(0.5)
+            except OSError as exc:
+                note('could not open raw socket: %s' % exc)
+                time.sleep(5)
+                continue
+            interface_ready = True
+            note('monitor mode ready')
+
+        now = time.time()
+        if now >= next_hop:
+            channel = channels[channel_index % len(channels)]
+            current_channel = channel
+            channel_index += 1
+            ok, message = set_channel(iw, args.interface, channel)
+            if not ok and message != last_channel_error:
+                note('channel %d failed: %s' % (channel, message))
+                last_channel_error = message
+            next_hop = now + args.dwell
+
+        try:
+            data = sock.recv(65535)
+        except socket.timeout:
+            data = None
+        except OSError as exc:
+            note('capture socket error: %s' % exc)
+            try:
+                sock.close()
+            except OSError:
+                pass
+            sock = None
+            interface_ready = False
+            time.sleep(1)
+            continue
+
+        if data:
+            packets += 1
+            parsed = parse_frame(data)
+            if parsed:
+                stamp = now_text()
+                src = parsed['addr2']
+                bssid = parsed['addr3']
+                if src not in (BCAST, ZERO):
+                    key = mac(src).lower()
+                    entry = tracker.get(key)
+                    if entry is None:
+                        entry = {'mac': key, 'first_seen': stamp,
+                                 'packet_types': {}, 'ssids': [], 'count': 0}
+                        tracker[key] = entry
+                    entry['last_seen'] = stamp
+                    entry['last_epoch'] = time.time()
+                    entry['count'] += 1
+                    kind = parsed['kind']
+                    entry['packet_types'][kind] = entry['packet_types'].get(kind, 0) + 1
+                    if parsed['ssid'] and kind == 'probe-req':
+                        if parsed['ssid'] not in entry['ssids']:
+                            entry['ssids'] = ([parsed['ssid']] + entry['ssids'])[:8]
+                        pkey = (key, parsed['ssid'])
+                        probe = probes.get(pkey)
+                        if probe is None:
+                            probes[pkey] = {'mac': key, 'ssid': parsed['ssid'],
+                                            'first_seen': stamp, 'last_seen': stamp,
+                                            'count': 1, 'last_epoch': time.time()}
+                        else:
+                            probe['last_seen'] = stamp
+                            probe['last_epoch'] = time.time()
+                            probe['count'] += 1
+                    dirty = True
+
+                if parsed['type'] == 0 and parsed['subtype'] in (8, 5) and bssid not in (BCAST, ZERO):
+                    key = mac(bssid).lower()
+                    ap = aps.get(key)
+                    if ap is None:
+                        ap = {'ssid': parsed['ssid'] or '', 'bssid': key,
+                              'channel': parsed.get('ap_channel') or parsed['channel'] or 0,
+                              'signal': parsed['dbm'] if parsed['dbm'] is not None else 0,
+                              'signal_unit': 'dBm', 'encryption': parsed['encryption'],
+                              'first_seen': stamp}
+                        aps[key] = ap
+                    if parsed['ssid']:
+                        ap['ssid'] = parsed['ssid']
+                    if parsed.get('ap_channel'):
+                        ap['channel'] = parsed['ap_channel']
+                    if parsed['dbm'] is not None:
+                        ap['signal'] = parsed['dbm']
+                    ap['encryption'] = parsed['encryption']
+                    ap['last_seen'] = stamp
+                    ap['last_epoch'] = time.time()
+                    dirty = True
+
+        if time.time() - last_status >= 5:
+            write_json(status_path, {
+                'state': 'running',
+                'updated': now_text(),
+                'updated_epoch': time.time(),
+                'channel': current_channel,
+                'packets': packets,
+                'aps': len(aps),
+                'probes': len(probes),
+                'devices': len(tracker),
+            })
+            last_status = time.time()
+
+        if dirty and time.time() - last_write >= 2:
+            cutoff = time.time() - 24 * 3600
+            ap_cutoff = time.time() - 30 * 60
+            # Drop stale entries from memory, not just from the snapshot.
+            probes = {k: v for k, v in probes.items() if v.get('last_epoch', 0) >= cutoff}
+            tracker = {k: v for k, v in tracker.items() if v.get('last_epoch', 0) >= cutoff}
+            aps = {k: v for k, v in aps.items() if v.get('last_epoch', 0) >= ap_cutoff}
+            probe_values = list(probes.values())
+            probe_values.sort(key=lambda x: x.get('last_seen', ''), reverse=True)
+            tracker_values = list(tracker.values())
+            tracker_values.sort(key=lambda x: x.get('last_seen', ''), reverse=True)
+            ap_values = list(aps.values())
+            ap_values.sort(key=lambda x: x.get('signal', -999), reverse=True)
+
+            def public(items):
+                return [{k: v for k, v in item.items() if k != 'last_epoch'}
+                        for item in items]
+
+            write_json(probes_path, public(probe_values[:1000]))
+            write_json(tracker_path, public(tracker_values[:1000]))
+            write_json(scan_path, public(ap_values[:500]))
+            last_write = time.time()
+            dirty = False
+
+    if sock is not None:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    note('monitor stopped')
+    write_json(status_path, {'state': 'stopped', 'updated': now_text(),
+                             'updated_epoch': time.time(), 'channel': 0,
+                             'packets': packets, 'aps': len(aps),
+                             'probes': len(probes), 'devices': len(tracker)})
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

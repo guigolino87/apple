@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""PiNAPPLE optimized beacon flood helper (authorized lab use only).
+
+The dashboard sends a file with one SSID per line. This helper turns those
+SSIDs into stable BSSID/SSID pairs for mdk4's ``-v`` mode and keeps the radio
+on one channel so a phone's short per-channel scan can hear the whole set.
+
+Two modes:
+
+* single channel (default) - one long-running mdk4 process, no restarts, so
+  the SSID sequence is continuous and every name gets repeated airtime.
+* multi-channel - SSIDs are partitioned across channels, each BSSID stays on
+  its assigned channel, and the radio rotates with a longer dwell. This is
+  for coverage, not for fastest discovery.
+
+Only the Python standard library is used.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+DEFAULT_PAIRS_FILE = '/etc/pinapple/beacon_mac_ssid.txt'
+DEFAULT_PAIRS_DIR = '/etc/pinapple'
+DEFAULT_STATUS_FILE = '/etc/pinapple/beacon_status.json'
+DEFAULT_LOG_FILE = '/var/log/pinapple/beacon-flood.log'
+
+_stop = False
+_child = None
+
+
+def note(message):
+    print(message, flush=True)
+
+
+def parse_channels(value):
+    channels = []
+    for item in str(value).split(','):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            channel = int(item)
+        except ValueError:
+            raise SystemExit('invalid channel: %s' % item)
+        if not 1 <= channel <= 14:
+            raise SystemExit('channel out of range (1-14): %s' % item)
+        if channel not in channels:
+            channels.append(channel)
+    if not channels:
+        raise SystemExit('no channels specified')
+    if len(channels) > 8:
+        raise SystemExit('at most 8 channels may be specified')
+    return channels
+
+
+def normalize_oui(value):
+    raw = value.replace(':', '').replace('-', '').strip()
+    if len(raw) != 6:
+        raise SystemExit('OUI must be 6 hex digits, e.g. 00:11:22')
+    try:
+        first = int(raw[0:2], 16) & 0xFE  # unicast, never multicast
+        return '%02x:%s:%s' % (first, raw[2:4].lower(), raw[4:6].lower())
+    except ValueError:
+        raise SystemExit('OUI must be hexadecimal')
+
+
+def load_ssids(path):
+    try:
+        with open(path) as handle:
+            lines = [line.strip() for line in handle if line.strip()]
+    except OSError as exc:
+        raise SystemExit('cannot read SSID file: %s' % exc)
+
+    clean = []
+    for ssid in lines:
+        # Newlines/control characters would split or corrupt the SSID.
+        ssid = ''.join(' ' if ord(ch) < 32 or ord(ch) == 127 else ch
+                       for ch in ssid).strip()
+        encoded = ssid.encode('utf-8', 'ignore')[:32]
+        decoded = encoded.decode('utf-8', 'ignore').strip()
+        if decoded and decoded not in clean:
+            clean.append(decoded)
+    if not clean:
+        raise SystemExit('SSID file contained no usable SSIDs')
+    return clean
+
+
+def auto_rate(count):
+    """A rate that lets a ~100 ms scan hear every SSID once."""
+    return max(200, min(500, count * 10))
+
+
+def build_pairs(ssids, oui, repeat):
+    """Return mdk4 -v lines: one deterministic BSSID per SSID, repeated."""
+    lines = []
+    for index, ssid in enumerate(ssids):
+        digest = hashlib.sha256(('%d:%s' % (index, ssid)).encode('utf-8', 'ignore')).digest()
+        mac = '%s:%02x:%02x:%02x' % (oui, digest[0] & 0xFE, digest[1], digest[2])
+        for _ in range(repeat):
+            lines.append('%s %s' % (mac, ssid))
+    return lines
+
+
+def partition(ssids, channels):
+    """Keep each BSSID on one channel; return [(channel, [ssid, ...]), ...]."""
+    groups = [[] for _ in channels]
+    for index, ssid in enumerate(ssids):
+        groups[index % len(channels)].append(ssid)
+    return [(channel, group) for channel, group in zip(channels, groups) if group]
+
+
+def write_atomic(path, payload):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp = '%s.tmp.%d' % (path, os.getpid())
+    with open(tmp, 'w') as handle:
+        handle.write(payload)
+    os.replace(tmp, path)
+
+
+def write_status(path, data):
+    data = dict(data)
+    data['updated_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+    data['updated_epoch'] = int(time.time())
+    try:
+        write_atomic(path, json.dumps(data, indent=2))
+    except OSError as exc:
+        note('could not write status file: %s' % exc)
+
+
+def find_binary(explicit, name):
+    if explicit:
+        return explicit
+    found = shutil.which(name)
+    if found:
+        return found
+    return '/usr/sbin/%s' % name
+
+
+def set_channel(iw, interface, channel):
+    try:
+        result = subprocess.run(
+            [iw, 'dev', interface, 'set', 'channel', str(channel)],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as exc:
+        note('could not run iw for channel %d: %s' % (channel, exc))
+        return False
+    if result.returncode != 0:
+        note('could not set channel %d: %s' % (
+            channel, (result.stderr or result.stdout).strip()))
+        return False
+    return True
+
+
+def set_txpower(iw, interface, dbm):
+    """Ask the driver for maximum TX power; ignore drivers that refuse."""
+    if not dbm:
+        return
+    try:
+        result = subprocess.run(
+            [iw, 'dev', interface, 'set', 'txpower', 'fixed', str(int(dbm * 100))],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if result.returncode != 0:
+        note('txpower request ignored: %s' %
+             ((result.stderr or result.stdout).strip() or 'unsupported'))
+
+
+def kill_child(child):
+    if child is None or child.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(child.pid), signal.SIGTERM)
+    except OSError:
+        try:
+            child.terminate()
+        except OSError:
+            pass
+    try:
+        child.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(child.pid), signal.SIGKILL)
+        except OSError:
+            try:
+                child.kill()
+            except OSError:
+                pass
+
+
+def handle_signal(signum, frame):
+    global _stop
+    _stop = True
+    kill_child(_child)
+
+
+def mdk4_command(mdk4, interface, pairs_file, channel, rate):
+    return [
+        mdk4, interface, 'b',
+        '-v', pairs_file,
+        '-t', '0',        # managed/AP beacons only (iOS ignores ad-hoc)
+        '-w', 'a',        # WPA2/AES only, no WEP/TKIP mixing
+        '-b', 'g',        # consistent 54 Mbit OFDM beacons
+        '-c', str(channel),
+        '-s', str(rate),
+    ]
+
+
+def base_status(ssid_count, rate, repeat, mode, started):
+    return {
+        'state': 'running',
+        'running': True,
+        'mode': mode,
+        'ssid_count': ssid_count,
+        'rate': rate,
+        'repeat': repeat,
+        'started_at': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(started)),
+        'started_epoch': int(started),
+        'helper_pid': os.getpid(),
+    }
+
+
+def run_single(mdk4, iw, interface, pairs_file, channel, rate, repeat,
+               ssid_count, status_file, log_file, txpower=0):
+    global _child
+    started = time.time()
+
+    set_txpower(iw, interface, txpower)
+    if not set_channel(iw, interface, channel):
+        write_status(status_file, {
+            'state': 'error', 'running': False, 'mode': 'single',
+            'error': 'could not set wlan1 to channel %d' % channel,
+        })
+        return 1
+
+    with open(log_file, 'a') as log_handle:
+        log_handle.write('\n--- single channel %d at %s ---\n' % (
+            channel, time.strftime('%H:%M:%S')))
+        log_handle.flush()
+        _child = subprocess.Popen(
+            mdk4_command(mdk4, interface, pairs_file, channel, rate),
+            stdout=log_handle, stderr=subprocess.STDOUT,
+            start_new_session=True)
+
+        time.sleep(0.35)
+        if _stop:
+            kill_child(_child)
+            return 0
+        if _child.poll() is not None:
+            status = base_status(ssid_count, rate, repeat, 'single', started)
+            status.update({
+                'state': 'error', 'running': False, 'channel': channel,
+                'error': 'mdk4 exited immediately (code %s)' % _child.returncode,
+            })
+            write_status(status_file, status)
+            return 1
+        # mdk4 may re-open/reinitialize the interface; re-assert the channel.
+        set_channel(iw, interface, channel)
+        last_channel_check = time.time()
+
+        status = base_status(ssid_count, rate, repeat, 'single', started)
+        status.update({
+            'channel': channel,
+            'uptime': int(time.time() - started),
+            'mdk4_pid': _child.pid,
+        })
+        write_status(status_file, status)
+
+        while not _stop:
+            if _child.poll() is not None:
+                code = _child.returncode
+                status = base_status(ssid_count, rate, repeat, 'single', started)
+                status.update({
+                    'state': 'error', 'running': False, 'channel': channel,
+                    'error': 'mdk4 exited unexpectedly (code %s)' % code,
+                })
+                write_status(status_file, status)
+                return 1
+            # Guard against another tool changing the channel underneath us.
+            if time.time() - last_channel_check >= 3:
+                set_channel(iw, interface, channel)
+                last_channel_check = time.time()
+            status = base_status(ssid_count, rate, repeat, 'single', started)
+            status.update({
+                'channel': channel,
+                'uptime': int(time.time() - started),
+                'mdk4_pid': _child.pid,
+            })
+            write_status(status_file, status)
+            time.sleep(1)
+
+    kill_child(_child)
+    return 0
+
+
+def run_rotating(mdk4, iw, interface, groups, rate, repeat, dwell,
+                 status_file, log_file, txpower=0):
+    global _child
+    started = time.time()
+    failures = {group['channel']: 0 for group in groups}
+    total_count = sum(group['count'] for group in groups)
+    cycle = 0
+
+    set_txpower(iw, interface, txpower)
+
+    while not _stop:
+        cycle += 1
+        any_ok = False
+
+        for group in groups:
+            if _stop:
+                break
+            channel = group['channel']
+            pairs_file = group['pairs_file']
+            if not set_channel(iw, interface, channel):
+                failures[channel] += 1
+                continue
+
+            with open(log_file, 'a') as log_handle:
+                log_handle.write('\n--- channel %d (cycle %d) at %s ---\n' % (
+                    channel, cycle, time.strftime('%H:%M:%S')))
+                log_handle.flush()
+                _child = subprocess.Popen(
+                    mdk4_command(mdk4, interface, pairs_file, channel, rate),
+                    stdout=log_handle, stderr=subprocess.STDOUT,
+                    start_new_session=True)
+
+            time.sleep(0.25)
+            if _stop:
+                kill_child(_child)
+                break
+            if _child.poll() is not None:
+                failures[channel] += 1
+                note('mdk4 exited immediately on channel %d (code %s)' % (
+                    channel, _child.returncode))
+                _child = None
+                continue
+            set_channel(iw, interface, channel)
+
+            status = base_status(total_count, rate, repeat, 'rotating', started)
+            status.update({
+                'channel': channel,
+                'cycle': cycle,
+                'group_count': group['count'],
+                'dwell': dwell,
+                'uptime': int(time.time() - started),
+                'mdk4_pid': _child.pid,
+            })
+            write_status(status_file, status)
+
+            phase_start = time.time()
+            early = False
+            while not _stop and time.time() - phase_start < dwell:
+                if _child.poll() is not None:
+                    early = True
+                    break
+                status = base_status(total_count, rate, repeat, 'rotating', started)
+                status.update({
+                    'channel': channel,
+                    'cycle': cycle,
+                    'group_count': group['count'],
+                    'dwell': dwell,
+                    'uptime': int(time.time() - started),
+                    'mdk4_pid': _child.pid,
+                })
+                write_status(status_file, status)
+                time.sleep(0.5)
+
+            exit_code = _child.returncode if early else None
+            kill_child(_child)
+            _child = None
+
+            if early:
+                failures[channel] += 1
+                note('mdk4 exited early on channel %d (code %s)' % (
+                    channel, exit_code))
+            else:
+                failures[channel] = 0
+                any_ok = True
+
+        if not any_ok and all(value >= 2 for value in failures.values()):
+            status = base_status(total_count, rate, repeat, 'rotating', started)
+            status.update({
+                'state': 'error',
+                'running': False,
+                'error': 'mdk4 failed on every channel; check the log',
+            })
+            write_status(status_file, status)
+            return 1
+
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description='PiNAPPLE optimized beacon flood')
+    parser.add_argument('ssid_file', help='file with one SSID per line')
+    parser.add_argument('interface', nargs='?', default='wlan1')
+    parser.add_argument('--rate', type=int, default=0,
+                        help='packets per second; 0 = auto (10 x SSIDs, 200-500)')
+    parser.add_argument('--channels', default='6',
+                        help='comma-separated 2.4GHz channels (default: 6)')
+    parser.add_argument('--dwell', type=float, default=8.0,
+                        help='seconds per channel in multi-channel mode (default: 8)')
+    parser.add_argument('--repeat', type=int, default=1,
+                        help='beacons per SSID per pass (default: 1)')
+    parser.add_argument('--txpower', type=float, default=20.0,
+                        help='request TX power in dBm (0 disables, default: 20)')
+    parser.add_argument('--oui', default='00:11:22', help='OUI prefix for generated BSSIDs')
+    parser.add_argument('--pairs-file', default=DEFAULT_PAIRS_FILE)
+    parser.add_argument('--pairs-dir', default=DEFAULT_PAIRS_DIR)
+    parser.add_argument('--status-file', default=DEFAULT_STATUS_FILE)
+    parser.add_argument('--log-file', default=DEFAULT_LOG_FILE)
+    parser.add_argument('--mdk4', default=None, help='path to mdk4 (auto-detected by default)')
+    parser.add_argument('--iw', default=None, help='path to iw (auto-detected by default)')
+    args = parser.parse_args()
+
+    if args.rate and not 20 <= args.rate <= 2000:
+        raise SystemExit('rate must be 0 (auto) or between 20 and 2000 packets/second')
+    if not 1 <= args.dwell <= 60:
+        raise SystemExit('dwell must be between 1 and 60 seconds')
+    if not 1 <= args.repeat <= 10:
+        raise SystemExit('repeat must be between 1 and 10')
+    if not 0 <= args.txpower <= 30:
+        raise SystemExit('txpower must be between 0 and 30 dBm')
+
+    channels = parse_channels(args.channels)
+    oui = normalize_oui(args.oui)
+    ssids = load_ssids(args.ssid_file)
+    rate = args.rate or auto_rate(len(ssids))
+
+    os.makedirs(os.path.dirname(args.log_file) or '/tmp', exist_ok=True)
+    os.makedirs(args.pairs_dir, exist_ok=True)
+
+    mdk4 = find_binary(args.mdk4, 'mdk4')
+    iw = find_binary(args.iw, 'iw')
+    missing = [name for name, path in (('mdk4', mdk4), ('iw', iw))
+               if not os.path.exists(path)]
+    if missing:
+        message = 'required tool(s) missing: %s' % ', '.join(missing)
+        write_status(args.status_file, {'state': 'error', 'running': False,
+                                        'error': message})
+        note(message)
+        return 1
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    note('beacon flood starting: %d SSIDs, %d pps, channels %s, %s mode' % (
+        len(ssids), rate, ','.join(str(c) for c in channels),
+        'single' if len(channels) == 1 else 'rotating'))
+
+    rc = 0
+    try:
+        if len(channels) == 1:
+            pairs = build_pairs(ssids, oui, args.repeat)
+            write_atomic(args.pairs_file, '\n'.join(pairs) + '\n')
+            rc = run_single(mdk4, iw, args.interface, args.pairs_file,
+                            channels[0], rate, args.repeat, len(ssids),
+                            args.status_file, args.log_file, args.txpower)
+        else:
+            groups = []
+            for channel, group in partition(ssids, channels):
+                pairs_file = os.path.join(args.pairs_dir, 'beacon_pairs_%d.txt' % channel)
+                pairs = build_pairs(group, oui, args.repeat)
+                write_atomic(pairs_file, '\n'.join(pairs) + '\n')
+                groups.append({
+                    'channel': channel,
+                    'count': len(group),
+                    'pairs_file': pairs_file,
+                })
+            if not groups:
+                raise SystemExit('no SSIDs were assigned to channels')
+            rc = run_rotating(mdk4, iw, args.interface, groups, rate,
+                              args.repeat, args.dwell, args.status_file,
+                              args.log_file, args.txpower)
+    except Exception as exc:
+        write_status(args.status_file, {
+            'state': 'error', 'running': False,
+            'error': str(exc),
+        })
+        note('beacon flood failed: %s' % exc)
+        rc = 1
+    finally:
+        kill_child(_child)
+        if rc == 0:
+            try:
+                os.remove(args.status_file)
+            except OSError:
+                pass
+        note('beacon flood stopped')
+
+    return rc
+
+
+if __name__ == '__main__':
+    sys.exit(main())

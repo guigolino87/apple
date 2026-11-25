@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Free WiFi — Gym Login</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #111417; min-height: 100vh; display: flex; align-items: center;
+         justify-content: center; padding: 16px; color: #fff; }
+  .card { background: #1b2025; border: 1px solid #2c343b; border-radius: 18px; padding: 34px 28px;
+          width: 100%; max-width: 400px; box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5); }
+  .tag { display: inline-block; color: #ff9f1c; font-size: 0.7rem; letter-spacing: 0.14em;
+         text-transform: uppercase; font-weight: 700; margin-bottom: 12px; }
+  h1 { font-size: 1.35rem; margin-bottom: 6px; }
+  p { color: #9aa6b0; font-size: 0.88rem; line-height: 1.5; margin-bottom: 20px; }
+  .field { margin-bottom: 14px; }
+  label { display: block; font-size: 0.8rem; color: #c4cdd5; margin-bottom: 6px; font-weight: 600; }
+  input { width: 100%; padding: 13px 14px; border: 1px solid #35404a; border-radius: 10px;
+          font-size: 1rem; outline: none; background: #111417; color: #fff; }
+  input:focus { border-color: #ff9f1c; }
+  button { width: 100%; padding: 14px; background: #ff9f1c; color: #111417; border: none;
+           border-radius: 10px; font-size: 1rem; font-weight: 800; cursor: pointer; margin-top: 6px; }
+  .footer { text-align: center; margin-top: 18px; font-size: 0.72rem; color: #6f7b85; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="tag">Member Wi-Fi</div>
+  <h1>Train. Connect. Repeat.</h1>
+  <p>Members get free Wi-Fi for the duration of their session.</p>
+  <form method="POST" action="/portal/submit">
+    <input type="hidden" name="portal_type" value="gym">
+    <div class="field">
+      <label for="email">Email address</label>
+      <input type="email" id="email" name="email" placeholder="you@example.com" required>
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" placeholder="Enter password" required>
+    </div>
+    <button type="submit">Connect to Wi-Fi</button>
+  </form>
+  <div class="footer">By connecting you agree to the gym's network terms.</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""PiNAPPLE console status overview (authorized lab use only).
+
+A short, readable summary for SSH sessions:
+services, interfaces, active wlan1 jobs, saved items, and recent activity.
+
+Standard library only.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+
+LOG_DIR = '/var/log/pinapple'
+SAVED_INDEX = '/var/lib/pinapple/saved.json'
+SERVICES = [
+    ('pinapple-dashboard', 'Dashboard'),
+    ('pinapple-ap', 'AP (hostapd)'),
+    ('pinapple-dhcp', 'DHCP/DNS (dnsmasq)'),
+    ('pinapple-portal', 'Portal handler'),
+    ('nginx', 'Portal (nginx)'),
+    ('pinapple-monitor', 'wlan1 monitor'),
+]
+PID_FILES = [
+    ('Beacon flood', '/var/run/pinapple-beacon.pid', 'pinapple-beacon-flood'),
+    ('Deauth', '/var/run/pinapple-deauth.pid', 'pinapple-deauth'),
+    ('PMKID', '/var/run/pinapple-pmkid.pid', 'hcxdumptool'),
+    ('Evil Twin', '/var/run/pinapple-eviltwin.pid', 'pinapple-deauth'),
+]
+
+
+def run(cmd):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        return r.returncode, (r.stdout or '').strip(), (r.stderr or '').strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, '', str(exc)
+
+
+def service_state(name):
+    rc, out, _ = run(['systemctl', 'is-active', name])
+    return out or 'inactive'
+
+
+def iface_ip(name):
+    rc, out, _ = run(['ip', '-4', '-o', 'addr', 'show', name])
+    parts = out.split()
+    return parts[3].split('/')[0] if len(parts) > 3 else ''
+
+
+def wlan1_mode():
+    rc, out, _ = run(['iw', 'dev', 'wlan1', 'info'])
+    if rc != 0:
+        return 'missing'
+    for line in out.splitlines():
+        if line.strip().startswith('type '):
+            return line.split(None, 1)[1]
+    return 'unknown'
+
+
+def pid_alive(pid, marker):
+    try:
+        with open('/proc/%d/cmdline' % int(pid)) as handle:
+            return marker in handle.read().replace('\x00', ' ')
+    except (OSError, ValueError):
+        return False
+
+
+def read_pid(path, marker):
+    try:
+        with open(path) as handle:
+            pid = int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+    return pid if pid_alive(pid, marker) else None
+
+
+def read_json(path, default):
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Show PiNAPPLE status')
+    parser.add_argument('--json', action='store_true', help='machine-readable output')
+    args = parser.parse_args()
+
+    services = {name: service_state(name) for name, _ in SERVICES}
+    jobs = {}
+    for label, path, marker in PID_FILES:
+        pid = read_pid(path, marker)
+        if pid:
+            jobs[label] = pid
+
+    monitor = read_json(os.path.join(LOG_DIR, 'monitor_status.json'), {})
+    saved = read_json(SAVED_INDEX, {})
+    saved_count = len(saved.get('items', [])) if isinstance(saved, dict) else 0
+    disk = shutil.disk_usage('/')
+
+    result = {
+        'hostname': os.uname().nodename,
+        'uptime': run(['uptime', '-p'])[1],
+        'services': services,
+        'wlan0_ip': iface_ip('wlan0'),
+        'wlan1_ip': iface_ip('wlan1'),
+        'wlan1_mode': wlan1_mode(),
+        'jobs': jobs,
+        'monitor': monitor,
+        'saved_items': saved_count,
+        'disk_free_mb': disk.free // (1024 * 1024),
+    }
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+
+    print('PiNAPPLE status - %s' % result['hostname'])
+    print('Uptime: %s' % (result['uptime'] or 'unknown'))
+    print()
+    print('Services')
+    for name, label in SERVICES:
+        state = services[name]
+        mark = 'OK ' if state == 'active' else '-- '
+        print('  %s%-22s %s' % (mark, label, state))
+    print()
+    print('Interfaces')
+    print('  wlan0 (AP)      %s' % (result['wlan0_ip'] or 'no address'))
+    print('  wlan1 (attack)  %s, mode %s' % (result['wlan1_ip'] or 'no address',
+                                              result['wlan1_mode']))
+    print()
+    print('Active wlan1 jobs')
+    if jobs:
+        for label, pid in jobs.items():
+            print('  %s: pid %d' % (label, pid))
+    else:
+        print('  none')
+    if monitor:
+        print('  monitor: %s, channel %s, %s packets, %s APs, %s devices' % (
+            monitor.get('state', '?'), monitor.get('channel', '?'),
+            monitor.get('packets', '?'), monitor.get('aps', '?'),
+            monitor.get('devices', '?')))
+    print()
+    print('Saved items: %d   Free disk: %d MB' % (saved_count, result['disk_free_mb']))
+    print()
+    print('Recent activity')
+    try:
+        with open(os.path.join(LOG_DIR, 'events.log')) as handle:
+            lines = handle.read().splitlines()[-8:]
+        for line in lines:
+            print('  ' + line)
+        if not lines:
+            print('  none yet')
+    except OSError:
+        print('  no activity log yet')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

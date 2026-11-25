@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-# PiNAPPLE Extensions: PineAP Suite, Loot Manager, Campaigns
+# EXPERIMENTAL / DORMANT
+# PiNAPPLE Extensions: PineAP Suite, Loot Manager, Campaigns.
+#
+# This module is intentionally NOT registered by app.py. Its MDK4/PMKID
+# routes predate the wlan1 ownership lock and would bypass it. Keep it as a
+# source of ideas (SSID pool, filters, reports) until those pieces are ported
+# into app.py with the same arbitration.
 from ext_helpers import (sysinfo, load_ssid_pool, save_ssid_pool,
     load_filter_list, save_filter_list, load_pineap_cfg, save_pineap_cfg,
     get_pineap_events, loot_list, _proc_running, _kill_proc,
