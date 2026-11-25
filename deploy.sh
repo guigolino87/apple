@@ -47,13 +47,25 @@ systemctl daemon-reload
 
 echo "==> Restarting dashboard"
 systemctl restart pinapple-dashboard
-sleep 2
-if systemctl is-active --quiet pinapple-dashboard; then
-    echo "OK: dashboard active on 0.0.0.0:8080"
-else
+
+# app.py re-applies network flags and reconciles wlan1 before it binds, so the
+# listener can take several seconds to appear. Poll instead of assuming.
+code=000
+for _ in $(seq 1 20); do
+    sleep 1
+    code=$(curl -s -o /dev/null -m 2 -w '%{http_code}' http://127.0.0.1:8080/ || echo 000)
+    [[ "$code" == "401" || "$code" == "200" ]] && break
+done
+if ! systemctl is-active --quiet pinapple-dashboard; then
     echo "FAILED: dashboard did not start" >&2
     journalctl -u pinapple-dashboard -n 40 --no-pager >&2 || true
     exit 1
 fi
-curl -s -o /dev/null -m 3 -w 'local HTTP %{http_code}\n' http://127.0.0.1:8080/ || true
+if [[ "$code" == "401" || "$code" == "200" ]]; then
+    echo "OK: dashboard active, HTTP $code on 127.0.0.1:8080"
+else
+    echo "WARNING: dashboard active but HTTP $code on 127.0.0.1:8080" >&2
+    journalctl -u pinapple-dashboard -n 30 --no-pager >&2 || true
+    exit 1
+fi
 echo "Done. AP, DHCP, portal and the wlan1 monitor were left untouched."
