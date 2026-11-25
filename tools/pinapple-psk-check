@@ -152,7 +152,17 @@ def main():
             # pairwise; being explicit avoids "pre-shared key may be incorrect"
             # when the negotiated group cipher does not match.
             handle.write('\tkey_mgmt=WPA-PSK\n\tproto=RSN WPA\n'
-                         '\tpairwise=CCMP\n\tgroup=CCMP TKIP\n\tscan_ssid=1\n}\n')
+                         '\tpairwise=CCMP\n\tgroup=CCMP TKIP\n\tscan_ssid=1\n')
+            if args.channel:
+                # Scanning every channel is what made a check take 15-20s.
+                if args.channel == 14:
+                    freq = 2484
+                elif args.channel <= 14:
+                    freq = 2407 + (5 * args.channel)
+                else:
+                    freq = 5000 + (5 * args.channel)
+                handle.write('\tfreq_list=%d\n' % freq)
+            handle.write('}\n')
         try:
             os.remove(LOG_FILE)
         except OSError:

