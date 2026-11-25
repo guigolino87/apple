@@ -37,6 +37,9 @@ _evil_twin_starting = [False]
 _evil_twin_error = [None]
 _twin_capture = [None]
 _twin_capture_result = [None]
+_twin_ap_since = [0.0]
+_twin_seen_client = [False]
+TWIN_IDLE_REVERT_SECONDS = 120
 _wlan1_owner = [None]
 _wlan1_claimed_at = [0.0]
 _wlan1_lock = threading.Lock()
@@ -1358,6 +1361,15 @@ def watchdog_loop():
             cleanup_orphan_beacon()
             reconcile_wlan1_owner()
             prune_handshake_jobs()
+            # A twin nobody joined locks the operator out of the dashboard:
+            # if the phone never associates, put the normal AP back.
+            if (_evil_twin_job[0] is not None and not _evil_twin_starting[0]
+                    and _twin_ap_since[0]
+                    and time.time() - _twin_ap_since[0] > TWIN_IDLE_REVERT_SECONDS
+                    and not _twin_seen_client[0]):
+                audit('Twin had no clients after %ds; restoring the normal AP'
+                      % TWIN_IDLE_REVERT_SECONDS, 'warn')
+                _evil_twin_shutdown()
         except Exception:
             pass
 
@@ -4116,11 +4128,39 @@ def _evil_twin_shutdown():
     terminate_process_group(_evil_twin_job[0])
     _evil_twin_job[0] = None
     _evil_twin_info[0] = None
+    _twin_ap_since[0] = 0.0
+    _twin_seen_client[0] = False
     release_wlan1('eviltwin')
     if had_twin:
         restore_ap_after_eviltwin('twin stopped')
     restore_wlan1_idle()
     return had_twin
+
+
+def _twin_clients():
+    """Number of stations associated to the twin AP (wlan0)."""
+    try:
+        r = subprocess.run(['iw', 'dev', 'wlan0', 'station', 'dump'],
+                           capture_output=True, text=True, timeout=4)
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    return sum(1 for line in r.stdout.splitlines() if line.startswith('Station'))
+
+
+def _twin_status_payload():
+    info = _evil_twin_info[0] or read_json_file(EVILTWIN_STATE, {})
+    clients = _twin_clients() if (_evil_twin_job[0] is not None or _twin_ap_since[0]) else 0
+    if clients:
+        _twin_seen_client[0] = True
+    return {
+        'hostapd': service_status('pinapple-ap'),
+        'ssid': info.get('ssid', ''),
+        'channel': info.get('channel', ''),
+        'clients': clients,
+        'deauth': bool(_evil_twin_job[0] is not None and _evil_twin_job[0].poll() is None),
+        'ap_seconds': int(time.time() - _twin_ap_since[0]) if _twin_ap_since[0] else 0,
+        'idle_revert': TWIN_IDLE_REVERT_SECONDS,
+    }
 
 
 def _twin_capture_start(channel):
@@ -4272,6 +4312,8 @@ def _evil_twin_run(ssid, bssid, channel, ssid_trimmed, psk=''):
     except Exception as exc:
         _evil_twin_fail('could not start the cloned AP: %s' % exc)
         return
+    _twin_ap_since[0] = time.time()
+    _twin_seen_client[0] = False
 
     try:
         proc = subprocess.Popen(
@@ -4418,6 +4460,7 @@ def api_evil_twin_status():
                     'security': info.get('security', ''),
                     'error': ('' if running else (_evil_twin_error[0] or '')),
                     'capture': _twin_capture_payload(),
+                    'twin': _twin_status_payload(),
                     'last_psk': get_last_psk() or {}})
 
 
@@ -5388,9 +5431,14 @@ async function refreshEvilTwinStatus(){
       'Rebuilding wlan0 as ' + (r.ssid || 'the target') + ' on channel ' + (r.channel || '?') +
       (r.security ? ' (' + r.security + ')' : ''), '');
   } else if(running){
+    const t = r.twin || {};
     setStatusCard('et-status-card','et-state','et-sub','et-meta','on','Evil Twin active',
       'Cloning ' + (r.ssid || '?') + ' on channel ' + (r.channel || '?') +
-      (r.security ? ' (' + r.security + ')' : ''), '');
+      (r.security ? ' (' + r.security + ')' : '') +
+      ' · ' + (t.clients || 0) + ' client(s) · hostapd ' + (t.hostapd ? 'up' : 'DOWN') +
+      ((t.clients || 0) === 0 && t.ap_seconds
+        ? ' · reverts in ' + Math.max(0, (t.idle_revert || 120) - t.ap_seconds) + 's if nobody joins'
+        : ''), '');
     const ssidEl=document.getElementById('et-ssid');
     const bssidEl=document.getElementById('et-bssid');
     const chEl=document.getElementById('et-channel');
