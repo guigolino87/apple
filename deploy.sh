@@ -41,8 +41,14 @@ install -m 0644 app.py extensions.py ext_helpers.py portal_handler.py "$DEST/"
 mkdir -p "$DEST/portal"
 if [[ -d portal ]]; then
     for f in portal/*.html; do
-        [[ -e "$f" ]] && install -m 0644 "$f" "$DEST/portal/"
+        [[ -e "$f" ]] || continue
+        # Never overwrite the active-portal symlink with the stock redirect page.
+        [[ "$(basename "$f")" == "index.html" ]] && continue
+        install -m 0644 "$f" "$DEST/portal/"
     done
+    if [[ ! -e "$DEST/portal/index.html" ]]; then
+        install -m 0644 portal/index.html "$DEST/portal/index.html"
+    fi
 fi
 
 echo "==> Installing helper tools"

